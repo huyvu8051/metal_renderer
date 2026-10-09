@@ -2406,6 +2406,7 @@ impl NativeMetalRenderer {
         // separate submissions, and measuring only the scene pass hid their
         // cost entirely — switching the blit off looked free because its time
         // was never in the number being compared.
+        timings.command_buffers = self.last_command_buffers.len();
         for (label, previous) in self.last_command_buffers.drain(..) {
             // metal 0.33 binds neither of these.
             let raw = previous.as_ptr() as *mut Object;
@@ -2778,13 +2779,23 @@ impl NativeMetalRenderer {
         }
 
         encoder.end_encoding();
+        // With nothing to blit, the scene buffer presents its own drawable.
+        // Handing that to a second submission costs an extra command buffer and
+        // makes the present wait on this one through the scheduler.
+        if skip_blit {
+            command_buffer.present_drawable(drawable);
+        }
         command_buffer.commit();
         timings.scene_ms = scene_start.elapsed().as_secs_f32() * 1000.0;
         self.last_command_buffers.push(("scene", command_buffer.to_owned()));
+        if skip_blit {
+            return timings;
+        }
+
         let blit_start = std::time::Instant::now();
 
         let blit_command_buffer = self.queue.new_command_buffer();
-        if let Some(blit_pipeline) = self.blit_pipeline.as_ref().filter(|_| !skip_blit) {
+        if let Some(blit_pipeline) = self.blit_pipeline.as_ref() {
             let blit_pass_descriptor = RenderPassDescriptor::new();
             let blit_color_attachment = blit_pass_descriptor.color_attachments().object_at(0).unwrap();
             blit_color_attachment.set_texture(Some(drawable_texture));
@@ -2838,6 +2849,10 @@ pub struct FrameTimings {
     pub gpu_ms: f32,
     /// Every command buffer the frame submitted, not just the scene pass.
     pub gpu_total_ms: f32,
+    /// How many command buffers the frame submitted. Counted on submission, not
+    /// from the timestamps — a buffer with no GPU work has none, so it is
+    /// invisible in the timings while still costing a submission.
+    pub command_buffers: usize,
     pub gpu_status: u64,
     pub gpu_start: f64,
     pub gpu_end: f64,
