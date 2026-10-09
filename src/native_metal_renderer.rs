@@ -2411,10 +2411,13 @@ impl NativeMetalRenderer {
             let raw = previous.as_ptr() as *mut Object;
             let start: f64 = unsafe { msg_send![raw, GPUStartTime] };
             let end: f64 = unsafe { msg_send![raw, GPUEndTime] };
-            if end <= start {
+            let elapsed = ((end - start) * 1000.0) as f32;
+            // Timestamps that are not yet valid report a nonsense span — one
+            // sample came back as 6_547_575 ms — and a single one of those
+            // ruins the average for the whole window it lands in.
+            if !(0.0..1000.0).contains(&elapsed) {
                 continue;
             }
-            let elapsed = ((end - start) * 1000.0) as f32;
             timings.gpu_total_ms += elapsed;
             if label == "scene" {
                 timings.gpu_ms = elapsed;
