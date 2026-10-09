@@ -17,6 +17,8 @@ pub struct GltfVertex {
 }
 
 pub struct GltfMesh {
+    /// Reported so the two loaders' vertex counts can be compared.
+    pub vertex_count: usize,
     pub vertex_buffer: metal::Buffer,
     pub index_buffer: metal::Buffer,
     pub index_count: usize,
@@ -172,6 +174,7 @@ fn walk_node(
                 .and_then(|info| textures.get(info.texture().source().index()).cloned().flatten());
 
             meshes.push(GltfMesh {
+                vertex_count: vertices.len(),
                 vertex_buffer,
                 index_buffer,
                 index_count: indices.len(),
@@ -210,6 +213,12 @@ pub fn load_gltf_scene(device: &Device, path: &std::path::Path) -> Vec<GltfMesh>
     for node in scene.nodes() {
         walk_node(&node, mat4_identity(), &buffers, &textures, device, &mut meshes);
     }
-    println!("[gltf_scene] loaded {} meshes ({} textures) from {path:?}", meshes.len(), textures.len());
+    let indices: usize = meshes.iter().map(|m| m.index_count).sum();
+    let vertices: usize = meshes.iter().map(|m| m.vertex_count).sum();
+    println!(
+        "[gltf_scene] loaded {} meshes ({} textures), {vertices} unique vertices, {indices} indices from {path:?}",
+        meshes.len(),
+        textures.len()
+    );
     meshes
 }

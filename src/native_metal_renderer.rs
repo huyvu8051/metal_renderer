@@ -23,19 +23,21 @@ pub struct ShaderFeatures {
     pub normal_map: bool,
     pub specular: bool,
     pub point_light: bool,
+    /// Replace the fragment shader with a constant, to measure the floor.
+    pub flat: bool,
 }
 
 impl Default for ShaderFeatures {
     fn default() -> Self {
-        Self { shadows: true, normal_map: true, specular: true, point_light: true }
+        Self { shadows: true, normal_map: true, specular: true, point_light: true, flat: false }
     }
 }
 
 impl ShaderFeatures {
     pub fn defines(&self) -> String {
         format!(
-            "#define FEATURE_SHADOWS {}\n#define FEATURE_NORMAL_MAP {}\n#define FEATURE_SPECULAR {}\n#define FEATURE_POINT_LIGHT {}\n",
-            self.shadows as u8, self.normal_map as u8, self.specular as u8, self.point_light as u8
+            "#define FEATURE_SHADOWS {}\n#define FEATURE_NORMAL_MAP {}\n#define FEATURE_SPECULAR {}\n#define FEATURE_POINT_LIGHT {}\n#define FEATURE_FLAT {}\n",
+            self.shadows as u8, self.normal_map as u8, self.specular as u8, self.point_light as u8, self.flat as u8
         )
     }
 }
@@ -131,6 +133,12 @@ using namespace metal;
 #endif
 #ifndef FEATURE_POINT_LIGHT
 #define FEATURE_POINT_LIGHT 1
+#endif
+// Measurement floor: returns a constant without reading a texture or lighting
+// anything, so whatever fragment time remains is the cost of shading that many
+// pixels rather than the cost of this shader.
+#ifndef FEATURE_FLAT
+#define FEATURE_FLAT 0
 #endif
 
 struct Vertex {
@@ -240,6 +248,9 @@ fragment float4 sponza_fragment(VertexOut in [[stage_in]],
                                  sampler shadowSampler [[sampler(1)]],
                                  depth2d<float> pointShadowMap [[texture(2)]],
                                  texture2d<float> normalTexture [[texture(3)]]) {
+#if FEATURE_FLAT
+    return float4(0.6, 0.6, 0.6, 1.0);
+#else
     // Geometric (per-vertex-interpolated) normal, reoriented by the
     // sampled normal map below when this mesh actually has one — see
     // ExtractedMesh::normal_texture's own doc comment (native_game_
@@ -332,6 +343,7 @@ fragment float4 sponza_fragment(VertexOut in [[stage_in]],
     // blur/threshold pass.
     lit += uniforms.emissive.rgb;
     return float4(lit, baseColor.a);
+#endif
 }
 "#;
 
@@ -953,6 +965,8 @@ pub struct NativeMetalRenderer {
     sponza_pipeline_no_msaa: Option<RenderPipelineState>,
     sponza_blend_pipeline: Option<RenderPipelineState>,
     sponza_blend_pipeline_no_msaa: Option<RenderPipelineState>,
+    sponza_pipeline_no_shadows: Option<RenderPipelineState>,
+    sponza_pipeline_no_shadows_no_msaa: Option<RenderPipelineState>,
     sponza_sampler: metal::SamplerState,
 
     shadow_map: metal::Texture,
@@ -993,7 +1007,8 @@ pub struct NativeMetalRenderer {
 
     real_game_textures: std::collections::HashMap<AssetId<Image>, metal::Texture>,
 
-    gpu_transformed_mesh_cache: std::collections::HashMap<AssetId<Mesh>, (metal::Buffer, usize)>,
+    gpu_transformed_mesh_cache:
+        std::collections::HashMap<AssetId<Mesh>, (metal::Buffer, metal::Buffer, usize, usize)>,
 
     real_game_camera_rotation: [f32; 4],
 
@@ -1020,21 +1035,31 @@ pub struct NativeMetalRenderer {
 
     ui_generic_nodes: Vec<super::snapshot::GenericUiNode>,
     skinned_texture_tiers: Vec<(&'static str, fn(u8) -> String)>,
-    /// Draw straight into the drawable instead of an offscreen target.
-    pub skip_blit: bool,
+    /// Force the offscreen target back on. It only earns its keep when the
+    /// scene renders at a different size than the drawable, or when MSAA has to
+    /// be resolved; otherwise it costs a full-screen store and a full-screen
+    /// load for nothing, so the default is to draw into the drawable.
+    pub force_offscreen: bool,
     /// Pin the shadow map to this size instead of following the quality tier.
     pub shadow_map_size_override: Option<u64>,
     /// Draw every mesh as opaque, ignoring its alpha mode. desert_rust_metal
     /// does this implicitly by never reading alphaMode at all.
     pub force_opaque: bool,
+    /// Kept one frame so its GPU timestamps can be read after it completes.
+    /// Last frame's submissions, labelled, kept so their GPU timestamps can be
+    /// read once they have completed.
+    last_command_buffers: Vec<(&'static str, metal::CommandBuffer)>,
+    shadow_quality_requested: u8,
 }
 
 fn normal_matrix_for(model: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     bevy::math::Mat4::from_cols_array_2d(&model).inverse().transpose().to_cols_array_2d()
 }
 
-fn bake_local_mesh_vertices(mesh: &ExtractedMesh) -> Vec<super::gltf_scene::GltfVertex> {
-    let mut verts = Vec::new();
+/// Vertices as authored, plus the index list that references them. Expanding
+/// the indices instead would run the vertex shader once per index rather than
+/// once per vertex, and give the post-transform cache nothing to reuse.
+fn bake_local_mesh_vertices(mesh: &ExtractedMesh) -> (Vec<super::gltf_scene::GltfVertex>, Vec<u32>) {
     let vertex_at = |idx: usize| -> super::gltf_scene::GltfVertex {
         let position = mesh.positions[idx];
         let normal = if mesh.normals.is_empty() { [0.0, 1.0, 0.0] } else { mesh.normals[idx] };
@@ -1042,16 +1067,13 @@ fn bake_local_mesh_vertices(mesh: &ExtractedMesh) -> Vec<super::gltf_scene::Gltf
         let tangent = if mesh.tangents.is_empty() { [1.0, 0.0, 0.0, 1.0] } else { mesh.tangents[idx] };
         super::gltf_scene::GltfVertex { position, normal, uv, tangent }
     };
-    if mesh.indices.is_empty() {
-        for idx in 0..mesh.positions.len() {
-            verts.push(vertex_at(idx));
-        }
+    let verts: Vec<_> = (0..mesh.positions.len()).map(vertex_at).collect();
+    let indices = if mesh.indices.is_empty() {
+        (0..mesh.positions.len() as u32).collect()
     } else {
-        for &idx in &mesh.indices {
-            verts.push(vertex_at(idx as usize));
-        }
-    }
-    verts
+        mesh.indices.clone()
+    };
+    (verts, indices)
 }
 
 fn build_projected_quad(
@@ -1356,7 +1378,9 @@ fn draw_generic_ui_nodes(
 
 struct RealGameMeshDraw<'a> {
     vertex_buffer: metal::Buffer,
-    vertex_count: usize,
+    index_buffer: metal::Buffer,
+    index_count: usize,
+    unique_vertices: usize,
     pub base_color_factor: [f32; 4],
     pub emissive: [f32; 4],
     texture: Option<&'a metal::Texture>,
@@ -1433,7 +1457,10 @@ impl NativeMetalRenderer {
             descriptor
         }
 
+        // Printed so a switch that silently fails to reach the shader cannot be
+        // mistaken for a switch that made no difference.
         let build_scene_pipelines = |defines: String, blending: bool| {
+            println!("[config] pipeline blending={blending} defines: {}", defines.replace('\n', " "));
             let source = format!("{defines}{SPONZA_SHADER_SOURCE}");
             match device.new_library_with_source(&source, &compile_options) {
                 Ok(library) => {
@@ -1454,6 +1481,12 @@ impl NativeMetalRenderer {
         };
 
         let (sponza_pipeline, sponza_pipeline_no_msaa) = build_scene_pipelines(features.defines(), false);
+        // With shadows off the passes that fill the shadow maps are skipped, so
+        // sampling them would read stale depth. This variant does not sample
+        // them at all, which also drops the per-pixel cost.
+        let unlit_by_shadows = ShaderFeatures { shadows: false, ..features };
+        let (sponza_pipeline_no_shadows, sponza_pipeline_no_shadows_no_msaa) =
+            build_scene_pipelines(unlit_by_shadows.defines(), false);
         // Transparent surfaces are drawn last, over geometry that is already
         // shaded, and cannot reject anything behind them. Shadow lookups,
         // normal mapping and specular are the costliest things in the shader
@@ -1464,6 +1497,7 @@ impl NativeMetalRenderer {
             normal_map: false,
             specular: false,
             point_light: features.point_light,
+            flat: features.flat,
         };
         let (sponza_blend_pipeline, sponza_blend_pipeline_no_msaa) =
             build_scene_pipelines(blend_features.defines(), true);
@@ -1494,6 +1528,7 @@ impl NativeMetalRenderer {
         flat_normal_descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
         let flat_normal_texture = device.new_texture(&flat_normal_descriptor);
         flat_normal_texture.replace_region(metal::MTLRegion::new_2d(0, 0, 1, 1), 0, [128u8, 128, 255, 255].as_ptr() as *const _, 4);
+
 
         let shadow_map_descriptor = metal::TextureDescriptor::new();
         shadow_map_descriptor.set_pixel_format(MTLPixelFormat::Depth32Float);
@@ -1788,6 +1823,8 @@ impl NativeMetalRenderer {
             sponza_pipeline_no_msaa,
             sponza_blend_pipeline,
             sponza_blend_pipeline_no_msaa,
+            sponza_pipeline_no_shadows,
+            sponza_pipeline_no_shadows_no_msaa,
             sponza_sampler,
             shadow_map,
             shadow_map_point,
@@ -1846,9 +1883,11 @@ impl NativeMetalRenderer {
             font_atlas_texture,
             ui_generic_nodes: Vec::new(),
             skinned_texture_tiers,
-            skip_blit: false,
+            force_offscreen: false,
             shadow_map_size_override: None,
             force_opaque: false,
+            last_command_buffers: Vec::new(),
+            shadow_quality_requested: 0,
         }
     }
 
@@ -1904,7 +1943,13 @@ impl NativeMetalRenderer {
         point_light_view_projection: [[f32; 4]; 4],
         camera_pos: [f32; 3],
     ) {
-        let sponza_pipeline = if msaa_enabled { self.sponza_pipeline.as_ref() } else { self.sponza_pipeline_no_msaa.as_ref() };
+        let shadows_on = self.shadow_quality_requested > 0;
+        let sponza_pipeline = match (msaa_enabled, shadows_on) {
+            (true, true) => self.sponza_pipeline.as_ref(),
+            (false, true) => self.sponza_pipeline_no_msaa.as_ref(),
+            (true, false) => self.sponza_pipeline_no_shadows.as_ref(),
+            (false, false) => self.sponza_pipeline_no_shadows_no_msaa.as_ref(),
+        };
         let sponza_blend_pipeline = if msaa_enabled {
             self.sponza_blend_pipeline.as_ref()
         } else {
@@ -1948,7 +1993,13 @@ impl NativeMetalRenderer {
             encoder.set_fragment_texture(0, Some(texture));
             let normal_texture = m.normal_texture.unwrap_or(&self.flat_normal_texture);
             encoder.set_fragment_texture(3, Some(normal_texture));
-            encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, m.vertex_count as u64);
+            encoder.draw_indexed_primitives(
+                MTLPrimitiveType::Triangle,
+                m.index_count as u64,
+                MTLIndexType::UInt32,
+                &m.index_buffer,
+                0,
+            );
         };
 
         if let Some(meshes) = real_game_meshes {
@@ -2116,6 +2167,7 @@ impl NativeMetalRenderer {
         // quality setting says, so their size is a real per-pixel cost and a
         // host measuring that cost needs to be able to pin it.
         let size = self.shadow_map_size_override.unwrap_or(SHADOW_MAP_SIZES[quality as usize]);
+        println!("[config] shadow map {size}px (quality {quality})");
         self.shadow_map = Self::make_shadow_texture(&self.device, size);
         self.shadow_map_point = Self::make_shadow_texture(&self.device, size);
         self.shadow_quality = quality;
@@ -2184,7 +2236,13 @@ impl NativeMetalRenderer {
                     let uniforms = SponzaShadowUniforms { light_view_projection, model_matrix: m.model_matrix };
                     encoder.set_vertex_buffer(0, Some(&m.vertex_buffer), 0);
                     encoder.set_vertex_bytes(1, std::mem::size_of::<SponzaShadowUniforms>() as u64, &uniforms as *const _ as *const _);
-                    encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, m.vertex_count as u64);
+                    encoder.draw_indexed_primitives(
+                MTLPrimitiveType::Triangle,
+                m.index_count as u64,
+                MTLIndexType::UInt32,
+                &m.index_buffer,
+                0,
+            );
                 }
             }
         }
@@ -2276,6 +2334,7 @@ impl NativeMetalRenderer {
             self.debug_lines = snapshot.debug_lines;
             self.msaa_enabled = snapshot.map_msaa_on;
             self.ensure_shadow_map_size(snapshot.shadow_quality);
+            self.shadow_quality_requested = snapshot.shadow_quality;
             self.render_resolution_scale = snapshot.render_resolution_scale.clamp(0.1, 1.0);
             self.apply_zombie_texture_quality(snapshot.zombie_texture_quality);
             if let Some(cam) = &snapshot.camera {
@@ -2329,7 +2388,9 @@ impl NativeMetalRenderer {
         // At native resolution with no multisampling there is nothing for the
         // offscreen target to buy, and skipping it saves a full-screen
         // read-write of the colour buffer.
-        let skip_blit = self.skip_blit && !msaa_enabled && render_width == width && render_height == height;
+        let skip_blit = !self.force_offscreen && !msaa_enabled && render_width == width && render_height == height;
+        timings.render_size = (render_width, render_height);
+        timings.skipped_blit = skip_blit;
         let offscreen = (!skip_blit).then(|| self.ensure_scene_color_texture(render_width, render_height));
         // next_drawable blocks until the display hands one back, so this is
         // where "the GPU or the refresh rate is the limit" shows up — keep it
@@ -2337,6 +2398,29 @@ impl NativeMetalRenderer {
         let wait_start = std::time::Instant::now();
         let Some(drawable) = self.layer.next_drawable() else { return timings };
         timings.drawable_wait_ms = wait_start.elapsed().as_secs_f32() * 1000.0;
+        // Read once the display has handed a drawable back, which means the GPU
+        // has retired an earlier frame — before that the timestamps are zero.
+        // This is real GPU execution time, unlike `drawable_wait_ms`, which is
+        // only the CPU blocked on it.
+        // Every buffer, not just the scene one: the shadow and blit passes are
+        // separate submissions, and measuring only the scene pass hid their
+        // cost entirely — switching the blit off looked free because its time
+        // was never in the number being compared.
+        for (label, previous) in self.last_command_buffers.drain(..) {
+            // metal 0.33 binds neither of these.
+            let raw = previous.as_ptr() as *mut Object;
+            let start: f64 = unsafe { msg_send![raw, GPUStartTime] };
+            let end: f64 = unsafe { msg_send![raw, GPUEndTime] };
+            if end <= start {
+                continue;
+            }
+            let elapsed = ((end - start) * 1000.0) as f32;
+            timings.gpu_total_ms += elapsed;
+            if label == "scene" {
+                timings.gpu_ms = elapsed;
+                timings.gpu_status = previous.status() as u64;
+            }
+        }
         let bookkeeping_start = std::time::Instant::now();
         let drawable_texture = drawable.texture();
         let texture = offscreen.unwrap_or_else(|| drawable_texture.to_owned());
@@ -2374,11 +2458,11 @@ impl NativeMetalRenderer {
             .filter(|mesh| mesh.visible)
             .filter_map(|mesh| {
 
-                let (vertex_buffer, vertex_count) = match self.gpu_transformed_mesh_cache.get(&mesh.mesh_id) {
+                let (vertex_buffer, index_buffer, index_count, unique_vertices) = match self.gpu_transformed_mesh_cache.get(&mesh.mesh_id) {
                     Some(cached) => cached.clone(),
                     None => {
-                        let verts = bake_local_mesh_vertices(mesh);
-                        if verts.is_empty() {
+                        let (verts, indices) = bake_local_mesh_vertices(mesh);
+                        if verts.is_empty() || indices.is_empty() {
                             bevy::log::warn!(
                                 "empty mesh skipped: positions={} normals={} uvs={} indices={}",
                                 mesh.positions.len(),
@@ -2393,7 +2477,12 @@ impl NativeMetalRenderer {
                             (verts.len() * std::mem::size_of::<super::gltf_scene::GltfVertex>()) as u64,
                             MTLResourceOptions::StorageModeShared,
                         );
-                        let entry = (buffer, verts.len());
+                        let index_buffer = self.device.new_buffer_with_data(
+                            indices.as_ptr() as *const _,
+                            (indices.len() * std::mem::size_of::<u32>()) as u64,
+                            MTLResourceOptions::StorageModeShared,
+                        );
+                        let entry = (buffer, index_buffer, indices.len(), verts.len());
                         self.gpu_transformed_mesh_cache.insert(mesh.mesh_id, entry.clone());
                         entry
                     }
@@ -2408,7 +2497,9 @@ impl NativeMetalRenderer {
                 ];
                 Some(RealGameMeshDraw {
                     vertex_buffer,
-                    vertex_count,
+                    index_buffer,
+                    index_count,
+                    unique_vertices,
                     base_color_factor: mesh.base_color,
                     emissive: mesh.emissive,
                     texture,
@@ -2425,8 +2516,9 @@ impl NativeMetalRenderer {
         timings.draws = real_game_meshes.len();
         timings.cached_textures = self.real_game_textures.len();
         timings.cached_meshes = self.gpu_transformed_mesh_cache.len();
-        timings.vertices_drawn = real_game_meshes.iter().map(|m| m.vertex_count).sum();
+        timings.vertices_drawn = real_game_meshes.iter().map(|m| m.index_count).sum();
         timings.blend_draws = real_game_meshes.iter().filter(|m| m.is_blend).count();
+        timings.unique_vertices = real_game_meshes.iter().map(|m| m.unique_vertices).sum();
         let passes_start = std::time::Instant::now();
 
         let aspect = width as f32 / height.max(1) as f32;
@@ -2500,7 +2592,15 @@ impl NativeMetalRenderer {
         );
         let light_view_projection = mat_mul(shadow_proj, shadow_view);
 
-        {
+        // Quality 0 means the player turned shadows off, so the pass has to go
+        // entirely. Shrinking the shadow map, which is all the setting used to
+        // do, left both passes still drawing every mesh in the scene — the
+        // texture was smaller but the geometry was not.
+        let draw_sun_shadows = self.shadow_quality_requested > 0;
+        // Nothing to cast from if there is no point light in range.
+        let draw_point_shadows = draw_sun_shadows && light.range > 0.0;
+
+        if draw_sun_shadows {
             let shadow_pass_descriptor = RenderPassDescriptor::new();
             let shadow_depth = shadow_pass_descriptor.depth_attachment().unwrap();
             shadow_depth.set_texture(Some(&self.shadow_map));
@@ -2517,6 +2617,7 @@ impl NativeMetalRenderer {
             }
             shadow_encoder.end_encoding();
             shadow_command_buffer.commit();
+            self.last_command_buffers.push(("sun shadow", shadow_command_buffer.to_owned()));
         }
 
         let point_light_pos = light.position;
@@ -2526,7 +2627,7 @@ impl NativeMetalRenderer {
         let point_light_proj = perspective(90.0_f32.to_radians(), 1.0, 0.1, light.range.max(SHADOW_DISTANCE * 2.0));
         let point_light_view_projection = mat_mul(point_light_proj, point_light_view);
 
-        {
+        if draw_point_shadows {
             let point_shadow_pass_descriptor = RenderPassDescriptor::new();
             let point_shadow_depth = point_shadow_pass_descriptor.depth_attachment().unwrap();
             point_shadow_depth.set_texture(Some(&self.shadow_map_point));
@@ -2542,6 +2643,7 @@ impl NativeMetalRenderer {
             }
             point_shadow_encoder.end_encoding();
             point_shadow_command_buffer.commit();
+            self.last_command_buffers.push(("point shadow", point_shadow_command_buffer.to_owned()));
         }
 
         if show_scope {
@@ -2581,6 +2683,7 @@ impl NativeMetalRenderer {
             );
             scope_encoder.end_encoding();
             scope_command_buffer.commit();
+            self.last_command_buffers.push(("scope", scope_command_buffer.to_owned()));
         }
 
         let pass_descriptor = RenderPassDescriptor::new();
@@ -2674,6 +2777,7 @@ impl NativeMetalRenderer {
         encoder.end_encoding();
         command_buffer.commit();
         timings.scene_ms = scene_start.elapsed().as_secs_f32() * 1000.0;
+        self.last_command_buffers.push(("scene", command_buffer.to_owned()));
         let blit_start = std::time::Instant::now();
 
         let blit_command_buffer = self.queue.new_command_buffer();
@@ -2693,6 +2797,7 @@ impl NativeMetalRenderer {
         }
         blit_command_buffer.present_drawable(drawable);
         blit_command_buffer.commit();
+        self.last_command_buffers.push(("blit", blit_command_buffer.to_owned()));
         timings.blit_ms = blit_start.elapsed().as_secs_f32() * 1000.0;
         timings
     }
@@ -2723,4 +2828,17 @@ pub struct FrameTimings {
     /// Meshes taking the blended path: no depth write, so nothing behind them
     /// can be rejected early.
     pub blend_draws: usize,
+    /// Vertices the meshes actually define, against `vertices_drawn` which
+    /// counts index fetches. The ratio is how much the loader split them.
+    pub unique_vertices: usize,
+    /// Real GPU execution time for the scene pass, from the previous frame.
+    pub gpu_ms: f32,
+    /// Every command buffer the frame submitted, not just the scene pass.
+    pub gpu_total_ms: f32,
+    pub gpu_status: u64,
+    pub gpu_start: f64,
+    pub gpu_end: f64,
+    /// The size actually rendered at, so GFX_RES_SCALE can be seen to apply.
+    pub render_size: (u64, u64),
+    pub skipped_blit: bool,
 }
