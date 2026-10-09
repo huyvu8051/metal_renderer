@@ -50,9 +50,6 @@ pub struct SkinnedModelSpec {
     pub scale: f32,
     pub y_offset: f32,
     pub facing_radians: f32,
-    /// Maps a quality tier to a base-colour texture path, for hosts that ship
-    /// several resolutions of the same model.
-    pub texture_for_tier: Option<fn(u8) -> String>,
 }
 
 #[derive(Copy, Clone)]
@@ -954,7 +951,6 @@ pub struct NativeMetalRenderer {
 
     render_resolution_scale: f32,
 
-    zombie_texture_quality: u8,
 
     scene_color_size: (u64, u64),
     scene_color_texture: metal::Texture,
@@ -1034,14 +1030,11 @@ pub struct NativeMetalRenderer {
 
 
     ui_generic_nodes: Vec<super::snapshot::GenericUiNode>,
-    skinned_texture_tiers: Vec<(&'static str, fn(u8) -> String)>,
     /// Force the offscreen target back on. It only earns its keep when the
     /// scene renders at a different size than the drawable, or when MSAA has to
     /// be resolved; otherwise it costs a full-screen store and a full-screen
     /// load for nothing, so the default is to draw into the drawable.
     pub force_offscreen: bool,
-    /// Pin the shadow map to this size instead of following the quality tier.
-    pub shadow_map_size_override: Option<u64>,
     /// Draw every mesh as opaque, ignoring its alpha mode. desert_rust_metal
     /// does this implicitly by never reading alphaMode at all.
     pub force_opaque: bool,
@@ -1611,10 +1604,6 @@ impl NativeMetalRenderer {
             };
 
         let resource_path = bundle_resource_path().unwrap_or_default();
-        let skinned_texture_tiers: Vec<(&'static str, fn(u8) -> String)> = skinned_model_specs
-            .iter()
-            .filter_map(|spec| spec.texture_for_tier.map(|f| (spec.name, f)))
-            .collect();
         let mut skinned_models = super::skinned_actor::SkinnedModelRegistry::default();
         for spec in skinned_model_specs {
             let path = std::path::Path::new(&resource_path).join("assets").join(spec.asset_path);
@@ -1843,7 +1832,6 @@ impl NativeMetalRenderer {
             msaa_enabled: false,
             shadow_quality: 5,
             render_resolution_scale: 1.0,
-            zombie_texture_quality: 255,
             scene_color_size: (0, 0),
             scene_color_texture,
             blit_pipeline,
@@ -1884,9 +1872,7 @@ impl NativeMetalRenderer {
             ui_sampler,
             font_atlas_texture,
             ui_generic_nodes: Vec::new(),
-            skinned_texture_tiers,
             force_offscreen: false,
-            shadow_map_size_override: None,
             force_opaque: false,
             last_command_buffers: Vec::new(),
             shadow_quality_requested: 0,
@@ -2169,7 +2155,7 @@ impl NativeMetalRenderer {
         // The fragment shader samples these twice per pixel whatever the
         // quality setting says, so their size is a real per-pixel cost and a
         // host measuring that cost needs to be able to pin it.
-        let size = self.shadow_map_size_override.unwrap_or(SHADOW_MAP_SIZES[quality as usize]);
+        let size = SHADOW_MAP_SIZES[quality as usize];
         println!("[config] shadow map {size}px (quality {quality})");
         self.shadow_map = Self::make_shadow_texture(&self.device, size);
         self.shadow_map_point = Self::make_shadow_texture(&self.device, size);
@@ -2192,38 +2178,6 @@ impl NativeMetalRenderer {
         tex
     }
 
-    fn apply_zombie_texture_quality(&mut self, tier: u8) {
-        let tier = tier.min(5);
-        if tier == self.zombie_texture_quality {
-            return;
-        }
-        let resource_path = bundle_resource_path().unwrap_or_default();
-        for (model_name, texture_for_tier) in self.skinned_texture_tiers.clone() {
-            let rel_path = texture_for_tier(tier);
-            let path = std::path::Path::new(&resource_path).join("assets").join(&rel_path);
-            let bytes = match std::fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    eprintln!("[native_metal_renderer] zombie texture read failed {path:?}: {err}");
-                    continue;
-                }
-            };
-            let decoded = match image::load_from_memory(&bytes) {
-                Ok(decoded) => decoded,
-                Err(err) => {
-                    eprintln!("[native_metal_renderer] zombie texture decode failed {path:?}: {err}");
-                    continue;
-                }
-            };
-            let rgba = decoded.to_rgba8();
-            let texture = super::metal_texture::upload_texture(&self.device, rgba.width(), rgba.height(), rgba.as_raw());
-            let Some(slot) = self.skinned_models.get_mut(model_name) else { continue };
-            for mesh in &mut slot.model.meshes {
-                mesh.base_color_texture = Some(texture.clone());
-            }
-        }
-        self.zombie_texture_quality = tier;
-    }
 
     fn draw_shadow_casters(
         &self,
@@ -2339,7 +2293,6 @@ impl NativeMetalRenderer {
             self.ensure_shadow_map_size(snapshot.shadow_quality);
             self.shadow_quality_requested = snapshot.shadow_quality;
             self.render_resolution_scale = snapshot.render_resolution_scale.clamp(0.1, 1.0);
-            self.apply_zombie_texture_quality(snapshot.zombie_texture_quality);
             if let Some(cam) = &snapshot.camera {
                 self.camera_position = cam.eye;
                 self.camera_yaw = cam.yaw;

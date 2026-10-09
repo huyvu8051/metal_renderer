@@ -87,7 +87,6 @@ pub struct RenderSnapshot {
 
     pub render_resolution_scale: f32,
 
-    pub zombie_texture_quality: u8,
 
     pub generic_ui_nodes: Vec<GenericUiNode>,
     pub debug_lines: Vec<DebugLine>,
