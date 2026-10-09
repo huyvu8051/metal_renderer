@@ -1050,6 +1050,7 @@ pub struct NativeMetalRenderer {
     /// read once they have completed.
     last_command_buffers: Vec<(&'static str, metal::CommandBuffer)>,
     shadow_quality_requested: u8,
+    frame_capture: Option<super::gpu_capture::FrameCapture>,
 }
 
 fn normal_matrix_for(model: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
@@ -1412,6 +1413,7 @@ impl NativeMetalRenderer {
         layer.set_drawable_size(CGSize::new(bounds.size.width * scale, bounds.size.height * scale));
 
         let queue = device.new_command_queue();
+        let frame_capture = super::gpu_capture::FrameCapture::from_env(&device, &queue);
 
         let compile_options = CompileOptions::new();
 
@@ -1888,6 +1890,7 @@ impl NativeMetalRenderer {
             force_opaque: false,
             last_command_buffers: Vec::new(),
             shadow_quality_requested: 0,
+            frame_capture,
         }
     }
 
@@ -2406,6 +2409,11 @@ impl NativeMetalRenderer {
         // separate submissions, and measuring only the scene pass hid their
         // cost entirely — switching the blit off looked free because its time
         // was never in the number being compared.
+        if let Some(capture) = &mut self.frame_capture {
+            if capture.frame_done() {
+                self.frame_capture = None;
+            }
+        }
         timings.command_buffers = self.last_command_buffers.len();
         for (label, previous) in self.last_command_buffers.drain(..) {
             // metal 0.33 binds neither of these.

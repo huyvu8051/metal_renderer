@@ -5,6 +5,8 @@
 pub mod gltf_materials;
 #[cfg(target_os = "ios")]
 pub mod gltf_scene;
+#[cfg(target_os = "ios")]
+pub mod gpu_capture;
 pub mod metal_math;
 pub mod metal_msaa;
 pub mod metal_texture;
