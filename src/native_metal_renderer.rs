@@ -951,6 +951,8 @@ pub struct NativeMetalRenderer {
     blit_vertex_buffer: metal::Buffer,
     sponza_pipeline: Option<RenderPipelineState>,
     sponza_pipeline_no_msaa: Option<RenderPipelineState>,
+    sponza_blend_pipeline: Option<RenderPipelineState>,
+    sponza_blend_pipeline_no_msaa: Option<RenderPipelineState>,
     sponza_sampler: metal::SamplerState,
 
     shadow_map: metal::Texture,
@@ -1020,6 +1022,11 @@ pub struct NativeMetalRenderer {
     skinned_texture_tiers: Vec<(&'static str, fn(u8) -> String)>,
     /// Draw straight into the drawable instead of an offscreen target.
     pub skip_blit: bool,
+    /// Pin the shadow map to this size instead of following the quality tier.
+    pub shadow_map_size_override: Option<u64>,
+    /// Draw every mesh as opaque, ignoring its alpha mode. desert_rust_metal
+    /// does this implicitly by never reading alphaMode at all.
+    pub force_opaque: bool,
 }
 
 fn normal_matrix_for(model: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
@@ -1399,10 +1406,14 @@ impl NativeMetalRenderer {
         ui_depth_descriptor.set_depth_write_enabled(false);
         let ui_depth_state = device.new_depth_stencil_state(&ui_depth_descriptor);
 
+        // Blending is switched on only for the meshes that need it. Leaving it
+        // on for opaque geometry costs a read-modify-write of the tile's colour
+        // buffer on every fragment of the whole scene.
         fn build_sponza_descriptor(
             vertex_fn: &metal::FunctionRef,
             fragment_fn: &metal::FunctionRef,
             sample_count: u64,
+            blending: bool,
         ) -> RenderPipelineDescriptor {
             let descriptor = RenderPipelineDescriptor::new();
             descriptor.set_vertex_function(Some(vertex_fn));
@@ -1410,7 +1421,7 @@ impl NativeMetalRenderer {
             let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
             color_attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
 
-            color_attachment.set_blending_enabled(true);
+            color_attachment.set_blending_enabled(blending);
             color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
             color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
             color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
@@ -1422,25 +1433,40 @@ impl NativeMetalRenderer {
             descriptor
         }
 
-        let sponza_source = format!("{}{SPONZA_SHADER_SOURCE}", features.defines());
-        let (sponza_pipeline, sponza_pipeline_no_msaa) =
-            match device.new_library_with_source(&sponza_source, &compile_options) {
-                Ok(sponza_library) => {
-                    let sponza_vertex_fn = sponza_library.get_function("sponza_vertex", None).unwrap();
-                    let sponza_fragment_fn = sponza_library.get_function("sponza_fragment", None).unwrap();
-                    let msaa_descriptor =
-                        build_sponza_descriptor(&sponza_vertex_fn, &sponza_fragment_fn, MSAA_SAMPLE_COUNT);
-                    let no_msaa_descriptor = build_sponza_descriptor(&sponza_vertex_fn, &sponza_fragment_fn, 1);
+        let build_scene_pipelines = |defines: String, blending: bool| {
+            let source = format!("{defines}{SPONZA_SHADER_SOURCE}");
+            match device.new_library_with_source(&source, &compile_options) {
+                Ok(library) => {
+                    let vertex_fn = library.get_function("sponza_vertex", None).unwrap();
+                    let fragment_fn = library.get_function("sponza_fragment", None).unwrap();
+                    let msaa = build_sponza_descriptor(&vertex_fn, &fragment_fn, MSAA_SAMPLE_COUNT, blending);
+                    let no_msaa = build_sponza_descriptor(&vertex_fn, &fragment_fn, 1, blending);
                     (
-                        device.new_render_pipeline_state(&msaa_descriptor).ok(),
-                        device.new_render_pipeline_state(&no_msaa_descriptor).ok(),
+                        device.new_render_pipeline_state(&msaa).ok(),
+                        device.new_render_pipeline_state(&no_msaa).ok(),
                     )
                 }
                 Err(err) => {
                     eprintln!("[native_metal_renderer] sponza shader compile failed: {err}");
                     (None, None)
                 }
-            };
+            }
+        };
+
+        let (sponza_pipeline, sponza_pipeline_no_msaa) = build_scene_pipelines(features.defines(), false);
+        // Transparent surfaces are drawn last, over geometry that is already
+        // shaded, and cannot reject anything behind them. Shadow lookups,
+        // normal mapping and specular are the costliest things in the shader
+        // and the least visible there, so the blended pass gets a variant
+        // without them. Diffuse lighting stays, so the look barely moves.
+        let blend_features = ShaderFeatures {
+            shadows: false,
+            normal_map: false,
+            specular: false,
+            point_light: features.point_light,
+        };
+        let (sponza_blend_pipeline, sponza_blend_pipeline_no_msaa) =
+            build_scene_pipelines(blend_features.defines(), true);
 
         let sampler_descriptor = metal::SamplerDescriptor::new();
         sampler_descriptor.set_min_filter(metal::MTLSamplerMinMagFilter::Linear);
@@ -1760,6 +1786,8 @@ impl NativeMetalRenderer {
             queue,
             sponza_pipeline,
             sponza_pipeline_no_msaa,
+            sponza_blend_pipeline,
+            sponza_blend_pipeline_no_msaa,
             sponza_sampler,
             shadow_map,
             shadow_map_point,
@@ -1819,6 +1847,8 @@ impl NativeMetalRenderer {
             ui_generic_nodes: Vec::new(),
             skinned_texture_tiers,
             skip_blit: false,
+            shadow_map_size_override: None,
+            force_opaque: false,
         }
     }
 
@@ -1875,6 +1905,11 @@ impl NativeMetalRenderer {
         camera_pos: [f32; 3],
     ) {
         let sponza_pipeline = if msaa_enabled { self.sponza_pipeline.as_ref() } else { self.sponza_pipeline_no_msaa.as_ref() };
+        let sponza_blend_pipeline = if msaa_enabled {
+            self.sponza_blend_pipeline.as_ref()
+        } else {
+            self.sponza_blend_pipeline_no_msaa.as_ref()
+        };
         let skinned_pipeline = if msaa_enabled { self.skinned_pipeline.as_ref() } else { self.skinned_pipeline_no_msaa.as_ref() };
         encoder.set_fragment_texture(1, Some(&self.shadow_map));
         encoder.set_fragment_sampler_state(1, Some(&self.shadow_sampler));
@@ -2013,7 +2048,7 @@ impl NativeMetalRenderer {
             blended.sort_by(|a, b| b.camera_dist_sq.total_cmp(&a.camera_dist_sq));
             if !blended.is_empty() {
                 encoder.set_depth_stencil_state(&self.blend_depth_state);
-                encoder.set_render_pipeline_state(sponza_pipeline.unwrap());
+                encoder.set_render_pipeline_state(sponza_blend_pipeline.unwrap_or(sponza_pipeline.unwrap()));
                 encoder.set_fragment_sampler_state(0, Some(&self.sponza_sampler));
                 for m in blended {
                     draw_static_mesh(m);
@@ -2077,7 +2112,10 @@ impl NativeMetalRenderer {
         if quality == self.shadow_quality {
             return;
         }
-        let size = SHADOW_MAP_SIZES[quality as usize];
+        // The fragment shader samples these twice per pixel whatever the
+        // quality setting says, so their size is a real per-pixel cost and a
+        // host measuring that cost needs to be able to pin it.
+        let size = self.shadow_map_size_override.unwrap_or(SHADOW_MAP_SIZES[quality as usize]);
         self.shadow_map = Self::make_shadow_texture(&self.device, size);
         self.shadow_map_point = Self::make_shadow_texture(&self.device, size);
         self.shadow_quality = quality;
@@ -2220,7 +2258,8 @@ impl NativeMetalRenderer {
         self.layer.contents_scale() as f32
     }
 
-    pub fn render_frame(&mut self, snapshot: RenderSnapshot) {
+    pub fn render_frame(&mut self, snapshot: RenderSnapshot) -> FrameTimings {
+        let mut timings = FrameTimings::default();
         self.sync_drawable_size();
         let drawable_size = self.layer.drawable_size();
         let (width, height) = (drawable_size.width as u64, drawable_size.height as u64);
@@ -2292,7 +2331,13 @@ impl NativeMetalRenderer {
         // read-write of the colour buffer.
         let skip_blit = self.skip_blit && !msaa_enabled && render_width == width && render_height == height;
         let offscreen = (!skip_blit).then(|| self.ensure_scene_color_texture(render_width, render_height));
-        let Some(drawable) = self.layer.next_drawable() else { return };
+        // next_drawable blocks until the display hands one back, so this is
+        // where "the GPU or the refresh rate is the limit" shows up — keep it
+        // out of the encode numbers.
+        let wait_start = std::time::Instant::now();
+        let Some(drawable) = self.layer.next_drawable() else { return timings };
+        timings.drawable_wait_ms = wait_start.elapsed().as_secs_f32() * 1000.0;
+        let bookkeeping_start = std::time::Instant::now();
         let drawable_texture = drawable.texture();
         let texture = offscreen.unwrap_or_else(|| drawable_texture.to_owned());
 
@@ -2320,6 +2365,7 @@ impl NativeMetalRenderer {
                 if !self.real_game_textures.contains_key(&t.id) {
                     let uploaded = super::metal_texture::upload_texture(&self.device, t.width, t.height, &t.rgba);
                     self.real_game_textures.insert(t.id, uploaded);
+                    timings.texture_uploads += 1;
                 }
             }
         }
@@ -2367,7 +2413,7 @@ impl NativeMetalRenderer {
                     emissive: mesh.emissive,
                     texture,
                     normal_texture,
-                    is_blend: mesh.is_blend,
+                    is_blend: mesh.is_blend && !self.force_opaque,
                     camera_dist_sq: d[0] * d[0] + d[1] * d[1] + d[2] * d[2],
                     model_matrix,
                 })
@@ -2375,6 +2421,13 @@ impl NativeMetalRenderer {
             .collect();
         let real_game_meshes_opt =
             if real_game_meshes.is_empty() { None } else { Some(real_game_meshes.as_slice()) };
+        timings.bookkeeping_ms = bookkeeping_start.elapsed().as_secs_f32() * 1000.0;
+        timings.draws = real_game_meshes.len();
+        timings.cached_textures = self.real_game_textures.len();
+        timings.cached_meshes = self.gpu_transformed_mesh_cache.len();
+        timings.vertices_drawn = real_game_meshes.iter().map(|m| m.vertex_count).sum();
+        timings.blend_draws = real_game_meshes.iter().filter(|m| m.is_blend).count();
+        let passes_start = std::time::Instant::now();
 
         let aspect = width as f32 / height.max(1) as f32;
         let far = if is_real_game { 500.0 } else { 100.0 };
@@ -2551,6 +2604,8 @@ impl NativeMetalRenderer {
         depth_attachment.set_store_action(MTLStoreAction::DontCare);
         depth_attachment.set_clear_depth(1.0);
 
+        timings.prepasses_ms = passes_start.elapsed().as_secs_f32() * 1000.0;
+        let scene_start = std::time::Instant::now();
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_render_command_encoder(pass_descriptor);
         encoder.set_depth_stencil_state(&self.depth_state);
@@ -2618,6 +2673,8 @@ impl NativeMetalRenderer {
 
         encoder.end_encoding();
         command_buffer.commit();
+        timings.scene_ms = scene_start.elapsed().as_secs_f32() * 1000.0;
+        let blit_start = std::time::Instant::now();
 
         let blit_command_buffer = self.queue.new_command_buffer();
         if let Some(blit_pipeline) = self.blit_pipeline.as_ref().filter(|_| !skip_blit) {
@@ -2636,5 +2693,34 @@ impl NativeMetalRenderer {
         }
         blit_command_buffer.present_drawable(drawable);
         blit_command_buffer.commit();
+        timings.blit_ms = blit_start.elapsed().as_secs_f32() * 1000.0;
+        timings
     }
+}
+
+/// Where one frame's CPU time went inside the renderer. `drawable_wait_ms` is
+/// the one to read first: it is time blocked on the display handing back a
+/// drawable, so a large value means the frame is limited by the GPU or by the
+/// refresh rate, not by anything the CPU is doing.
+#[derive(Default, Copy, Clone)]
+pub struct FrameTimings {
+    pub drawable_wait_ms: f32,
+    /// Texture and mesh cache upkeep plus building the draw list.
+    pub bookkeeping_ms: f32,
+    /// Shadow maps and the scope render target.
+    pub prepasses_ms: f32,
+    pub scene_ms: f32,
+    pub blit_ms: f32,
+    pub draws: usize,
+    /// GPU-side cache sizes. A frame rate that decays while the scene stands
+    /// still is usually one of these climbing.
+    pub cached_textures: usize,
+    pub cached_meshes: usize,
+    pub texture_uploads: usize,
+    /// Vertex shader invocations per frame. The ECS path de-indexes its meshes,
+    /// so this is the index count, not the unique-vertex count.
+    pub vertices_drawn: usize,
+    /// Meshes taking the blended path: no depth write, so nothing behind them
+    /// can be rejected early.
+    pub blend_draws: usize,
 }
