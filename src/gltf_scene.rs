@@ -17,6 +17,13 @@ pub struct GltfVertex {
 }
 
 pub struct GltfMesh {
+    pub emissive: [f32; 4],
+    /// From the material's `alphaMode`. The ECS path reads this too, and a
+    /// control case that draws transparent surfaces as opaque is not drawing
+    /// the same frame.
+    pub is_blend: bool,
+    /// World-space centre, for sorting the transparent draws back to front.
+    pub centre: [f32; 3],
     /// Reported so the two loaders' vertex counts can be compared.
     pub vertex_count: usize,
     pub vertex_buffer: metal::Buffer,
@@ -180,6 +187,24 @@ fn walk_node(
                 index_count: indices.len(),
                 base_color_texture,
                 base_color_factor: pbr.base_color_factor(),
+                centre: {
+                    let mut sum = [0.0f64; 3];
+                    for v in &vertices {
+                        sum[0] += v.position[0] as f64;
+                        sum[1] += v.position[1] as f64;
+                        sum[2] += v.position[2] as f64;
+                    }
+                    let n = vertices.len().max(1) as f64;
+                    [(sum[0] / n) as f32, (sum[1] / n) as f32, (sum[2] / n) as f32]
+                },
+                is_blend: matches!(
+                    primitive.material().alpha_mode(),
+                    gltf::material::AlphaMode::Blend
+                ),
+                emissive: {
+                    let e = primitive.material().emissive_factor();
+                    [e[0], e[1], e[2], 0.0]
+                },
             });
         }
     }
