@@ -12,7 +12,7 @@ use bevy::pbr::{MeshMaterial3d, StandardMaterial};
 use bevy::render::render_resource::TextureFormat;
 use bevy::transform::components::GlobalTransform;
 
-use crate::snapshot::{DecodedTextureCache, ExtractedMesh, ExtractedTexture};
+use crate::snapshot::{AstcBlock, DecodedTextureCache, ExtractedMesh, ExtractedTexture};
 pub type Q<'w, 's, D, F = ()> = Query<'w, 's, D, F>;
 
 pub type MeshChanged = (
@@ -64,6 +64,8 @@ pub fn decode_texture(
     }
     let image = images.get(handle)?;
     let data = image.data.as_ref()?;
+    use bevy::render::render_resource::{AstcBlock as B, AstcChannel};
+    let mut astc = None;
     let rgba: std::sync::Arc<[u8]> = match image.texture_descriptor.format {
         TextureFormat::Rgba8UnormSrgb | TextureFormat::Rgba8Unorm => std::sync::Arc::from(data.as_slice()),
         TextureFormat::Bgra8UnormSrgb | TextureFormat::Bgra8Unorm => {
@@ -73,6 +75,18 @@ pub fn decode_texture(
             }
             std::sync::Arc::from(swapped.as_slice())
         }
+        // Straight through. Returning None here is what left every ASTC
+        // texture unextracted and the map drawing in its fallback colour.
+        TextureFormat::Astc { block, channel } => {
+            let srgb = channel == AstcChannel::UnormSrgb;
+            astc = Some(match block {
+                B::B4x4 => AstcBlock::B4x4 { srgb },
+                B::B6x6 => AstcBlock::B6x6 { srgb },
+                B::B8x8 => AstcBlock::B8x8 { srgb },
+                _ => return None,
+            });
+            std::sync::Arc::from(data.as_slice())
+        }
         _ => return None,
     };
     let extracted = ExtractedTexture {
@@ -80,6 +94,7 @@ pub fn decode_texture(
         width: image.texture_descriptor.size.width,
         height: image.texture_descriptor.size.height,
         rgba,
+        astc,
     };
     texture_cache.0.insert(handle.id(), extracted.clone());
     Some(extracted)

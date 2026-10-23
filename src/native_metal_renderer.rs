@@ -2406,7 +2406,14 @@ impl NativeMetalRenderer {
         for image in self.ui_generic_nodes.iter().filter_map(|node| node.image.as_ref()) {
             if !self.real_game_textures.contains_key(&image.id) {
                 let uploaded =
-                    super::metal_texture::upload_texture(&self.device, image.width, image.height, &image.rgba);
+                    match image.astc {
+                        Some(block) => super::metal_texture::upload_astc(
+                            &self.device, image.width, image.height, &image.rgba, block,
+                        ),
+                        None => super::metal_texture::upload_texture(
+                            &self.device, image.width, image.height, &image.rgba,
+                        ),
+                    };
                 self.real_game_textures.insert(image.id, uploaded);
             }
         }
@@ -2418,7 +2425,14 @@ impl NativeMetalRenderer {
 
             for t in [mesh.texture.as_ref(), mesh.normal_texture.as_ref()].into_iter().flatten() {
                 if !self.real_game_textures.contains_key(&t.id) {
-                    let uploaded = super::metal_texture::upload_texture(&self.device, t.width, t.height, &t.rgba);
+                    let uploaded = match t.astc {
+                        Some(block) => super::metal_texture::upload_astc(
+                            &self.device, t.width, t.height, &t.rgba, block,
+                        ),
+                        None => super::metal_texture::upload_texture(
+                            &self.device, t.width, t.height, &t.rgba,
+                        ),
+                    };
                     self.real_game_textures.insert(t.id, uploaded);
                     timings.texture_uploads += 1;
                 }

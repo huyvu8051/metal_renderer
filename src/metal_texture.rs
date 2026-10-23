@@ -76,3 +76,57 @@ fn downsample_half(source: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32
 
     (out, next_width, next_height)
 }
+
+/// Uploads ASTC blocks untouched. Apple GPUs sample ASTC natively, so there is
+/// nothing to decode -- and decoding would undo the reason the textures were
+/// compressed in the first place.
+///
+/// No mip chain is generated: the blocks are already a finished level and the
+/// GPU cannot filter compressed data into smaller ones. A KTX2 that carries
+/// its own mips would need those passed level by level; the game's do not.
+pub fn upload_astc(
+    device: &Device,
+    width: u32,
+    height: u32,
+    blocks: &[u8],
+    block: crate::snapshot::AstcBlock,
+) -> metal::Texture {
+    use crate::snapshot::AstcBlock as B;
+    let (format, bw, bh) = match block {
+        B::B4x4 { srgb } => (
+            if srgb { MTLPixelFormat::ASTC_4x4_sRGB } else { MTLPixelFormat::ASTC_4x4_LDR },
+            4, 4,
+        ),
+        B::B6x6 { srgb } => (
+            if srgb { MTLPixelFormat::ASTC_6x6_sRGB } else { MTLPixelFormat::ASTC_6x6_LDR },
+            6, 6,
+        ),
+        B::B8x8 { srgb } => (
+            if srgb { MTLPixelFormat::ASTC_8x8_sRGB } else { MTLPixelFormat::ASTC_8x8_LDR },
+            8, 8,
+        ),
+    };
+
+    let descriptor = metal::TextureDescriptor::new();
+    descriptor.set_pixel_format(format);
+    descriptor.set_width(width as u64);
+    descriptor.set_height(height as u64);
+    descriptor.set_mipmap_level_count(1);
+    descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+    let texture = device.new_texture(&descriptor);
+
+    // ASTC is 16 bytes a block whatever the block size, so a row of blocks is
+    // 16 * ceil(width / block_width).
+    let bytes_per_row = 16 * width.div_ceil(bw) as u64;
+    texture.replace_region(
+        metal::MTLRegion {
+            origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            size: metal::MTLSize { width: width as u64, height: height as u64, depth: 1 },
+        },
+        0,
+        blocks.as_ptr() as *const _,
+        bytes_per_row,
+    );
+    let _ = bh;
+    texture
+}

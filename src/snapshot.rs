@@ -14,7 +14,21 @@ pub struct ExtractedTexture {
     pub width: u32,
     pub height: u32,
 
+    /// Either RGBA8 or, when `astc` is set, the ASTC blocks exactly as they
+    /// came out of the KTX2 file. Apple GPUs sample ASTC directly, so handing
+    /// it over untouched is both cheaper and the only way these load at all --
+    /// decoding was never the point of compressing them.
     pub rgba: std::sync::Arc<[u8]>,
+    pub astc: Option<AstcBlock>,
+}
+
+/// The block size, which is all the Metal pixel format needs beyond knowing
+/// it is ASTC and whether it is sRGB.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AstcBlock {
+    B4x4 { srgb: bool },
+    B6x6 { srgb: bool },
+    B8x8 { srgb: bool },
 }
 
 #[derive(Clone)]
