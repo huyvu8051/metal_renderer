@@ -1372,10 +1372,17 @@ fn draw_generic_ui_nodes(
     encoder.set_scissor_rect(generic_ui_scissor_rect(None, canvas_w, canvas_h, view_w, view_h));
 }
 
+/// Render layers, reduced to the only question a pass has to ask.
+fn draws_in_pass(mesh: &RealGameMeshDraw, scope_pass: bool) -> bool {
+    if scope_pass { !mesh.viewmodel } else { !mesh.reticle }
+}
+
 struct RealGameMeshDraw<'a> {
     /// Skipped by the scope pass: the gun is not part of the world the scope
     /// is looking at, and drawn there it shows up inside its own eyepiece.
     viewmodel: bool,
+    /// Skipped by every other pass: the reticle is the scope's own mark.
+    reticle: bool,
     vertex_buffer: metal::Buffer,
     index_buffer: metal::Buffer,
     index_count: usize,
@@ -1943,7 +1950,10 @@ impl NativeMetalRenderer {
         light_view_projection: [[f32; 4]; 4],
         point_light_view_projection: [[f32; 4]; 4],
         camera_pos: [f32; 3],
-        skip_viewmodel: bool,
+        // The scope pass leaves the weapon out; every other pass leaves the
+        // reticle out. Both are render layers the windowed build has and the
+        // snapshot had no way to express until now.
+        scope_pass: bool,
     ) {
         let shadows_on = self.shadow_quality_requested > 0;
         let sponza_pipeline = match (msaa_enabled, shadows_on) {
@@ -2008,7 +2018,7 @@ impl NativeMetalRenderer {
 
             encoder.set_render_pipeline_state(sponza_pipeline.unwrap());
             encoder.set_fragment_sampler_state(0, Some(&self.sponza_sampler));
-            for m in meshes.iter().filter(|m| !m.is_blend && !(skip_viewmodel && m.viewmodel)) {
+            for m in meshes.iter().filter(|m| !m.is_blend && draws_in_pass(m, scope_pass)) {
                 draw_static_mesh(m);
             }
         }
@@ -2099,7 +2109,7 @@ impl NativeMetalRenderer {
 
             let mut blended: Vec<&RealGameMeshDraw> = meshes
                 .iter()
-                .filter(|m| m.is_blend && !(skip_viewmodel && m.viewmodel))
+                .filter(|m| m.is_blend && draws_in_pass(m, scope_pass))
                 .collect();
             blended.sort_by(|a, b| b.camera_dist_sq.total_cmp(&a.camera_dist_sq));
             if !blended.is_empty() {
@@ -2332,7 +2342,14 @@ impl NativeMetalRenderer {
             self.real_game_light = LightUniform::from_snapshots(
                 snapshot.light.as_ref(),
                 snapshot.sun.as_ref(),
-                snapshot.light_quality.min(5) as f32 / 5.0,
+                // On or off, not a dimmer. The windowed build scales
+                // illuminance by the same fraction, but that is lux fed to a
+                // PBR pipeline with exposure, which normalises most of it
+                // away. Here the fraction lands directly on the final colour,
+                // so quality 3 of 5 rendered the whole scene at 74% of its
+                // albedo -- visibly darker than the same settings in the
+                // windowed build.
+                if snapshot.light_quality > 0 { 1.0 } else { 0.0 },
                 snapshot.point_light_quality.min(5) as f32 / 5.0,
             );
             real_game_static_meshes = snapshot.static_meshes;
@@ -2493,6 +2510,7 @@ impl NativeMetalRenderer {
                 ];
                 Some(RealGameMeshDraw {
                     viewmodel: mesh.viewmodel,
+                    reticle: mesh.reticle,
                     vertex_buffer,
                     index_buffer,
                     index_count,
@@ -2746,12 +2764,13 @@ impl NativeMetalRenderer {
                     )
                 });
                 let quad_buffer = real_game_quad_buffer.as_ref().unwrap_or(&self.quad_vertex_buffer);
-                // The scope picture is a composite, not geometry: it sits
-                // where the lens is, which is inside the scope tube, so a
-                // depth test against the scene loses to the gun's own body
-                // and the lens reads black once the weapon is fully raised.
-                // Inheriting the scene's depth state is what did that.
-                encoder.set_depth_stencil_state(&self.ui_depth_state);
+                // Depth tested on purpose, inheriting the scene's state: the
+                // lens sits inside the scope tube, so the tube's near rim
+                // draws over its edge and frames it, while the rest of the
+                // tube is behind and loses. Turning the test off instead --
+                // which an M4 with FORCE_SCOPE seemed to call for, since it
+                // has no tube and the lens lands nowhere sensible -- throws
+                // that framing away.
                 encoder.set_render_pipeline_state(quad_pipeline);
                 encoder.set_vertex_buffer(0, Some(quad_buffer), 0);
                 encoder.set_fragment_texture(0, Some(&self.scope_color_texture));

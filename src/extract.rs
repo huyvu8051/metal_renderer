@@ -132,12 +132,13 @@ pub fn store_extracted_mesh(
     used_texture_ids: &mut std::collections::HashSet<AssetId<Image>>,
     geometry_already_uploaded: &impl Fn(AssetId<Mesh>) -> bool,
     viewmodel: bool,
+    reticle: bool,
 ) {
     let slot = cache.slot_of.get(&entity).copied();
     let previous = slot.and_then(|slot| cache.entries.get(slot));
     let Some((extracted, textures_pending)) = extract_one_mesh(
         mesh3d, material3d, transform, visibility, meshes, materials, images,
-        texture_cache, used_texture_ids, geometry_already_uploaded, previous, viewmodel,
+        texture_cache, used_texture_ids, geometry_already_uploaded, previous, viewmodel, reticle,
     ) else {
         return;
     };
@@ -174,6 +175,7 @@ pub fn extract_one_mesh(
     geometry_already_uploaded: &impl Fn(AssetId<Mesh>) -> bool,
     previous: Option<&ExtractedMesh>,
     viewmodel: bool,
+    reticle: bool,
 ) -> Option<(ExtractedMesh, bool)> {
     let material = materials.get(&material3d.0)?;
     let mesh_id = mesh3d.id();
@@ -225,6 +227,7 @@ pub fn extract_one_mesh(
 
     Some((ExtractedMesh {
         viewmodel,
+        reticle,
         positions,
         normals,
         uvs,
