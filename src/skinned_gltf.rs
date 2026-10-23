@@ -175,19 +175,67 @@ fn read_mat4(raw: [[f32; 4]; 4]) -> Mat4 {
     raw
 }
 
+/// One glTF image, as a Metal texture. KTX2 goes across as ASTC blocks; a PNG
+/// or JPEG is decoded the old way. Returns None rather than failing the model,
+/// so a character with one unreadable texture still draws.
+fn load_image(
+    device: &Device,
+    image: &gltf::Image,
+    buffers: &[gltf::buffer::Data],
+    base: Option<&std::path::Path>,
+) -> Option<metal::Texture> {
+    let owned;
+    let bytes: &[u8] = match image.source() {
+        gltf::image::Source::View { view, .. } => {
+            let data = &buffers[view.buffer().index()];
+            &data[view.offset()..view.offset() + view.length()]
+        }
+        gltf::image::Source::Uri { uri, .. } => {
+            owned = std::fs::read(base?.join(uri)).ok()?;
+            &owned
+        }
+    };
+
+    if let Some(ktx) = super::metal_texture::parse_ktx2(bytes) {
+        return Some(super::metal_texture::upload_astc(
+            device,
+            ktx.width,
+            ktx.height,
+            &bytes[ktx.level0.clone()],
+            ktx.block,
+        ));
+    }
+
+    let decoded = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (w, h) = decoded.dimensions();
+    Some(super::metal_texture::upload_texture(device, w, h, decoded.as_raw()))
+}
+
 pub fn load_skinned_gltf(device: &Device, path: &std::path::Path) -> Option<SkinnedModel> {
-    let (document, buffers, images) = match gltf::import(path) {
-        Ok(result) => result,
+    // gltf::import decodes every image eagerly and gives up on the whole file
+    // if one is a format it does not know -- which every texture here is, since
+    // they are ASTC in KTX2. Buffers are imported on their own and the images
+    // handled below, where ASTC can go straight to the GPU.
+    let gltf = match gltf::Gltf::open(path) {
+        Ok(gltf) => gltf,
         Err(err) => {
             eprintln!("[skinned_gltf] failed to load {path:?}: {err}");
             return None;
         }
     };
+    let base = path.parent();
+    let blob = gltf.blob.clone();
+    let document = gltf.document;
+    let buffers = match gltf::import_buffers(&document, base, blob) {
+        Ok(buffers) => buffers,
+        Err(err) => {
+            eprintln!("[skinned_gltf] failed to read buffers of {path:?}: {err}");
+            return None;
+        }
+    };
 
-    let textures: Vec<Option<metal::Texture>> = images
-        .iter()
-        .map(|image| Some(super::metal_texture::upload_texture(device, image.width, image.height, &super::gltf_scene::to_rgba8(image))))
-        .collect();
+    let textures: Vec<Option<metal::Texture>> =
+        document.images().map(|image| load_image(device, &image, &buffers, base)).collect();
 
     let node_count = document.nodes().count();
     let mut node_children: Vec<Vec<usize>> = vec![Vec::new(); node_count];

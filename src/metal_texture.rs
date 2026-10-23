@@ -130,3 +130,64 @@ pub fn upload_astc(
     let _ = bh;
     texture
 }
+
+/// What a KTX2 file says about itself, enough to hand its blocks to Metal.
+pub struct Ktx2 {
+    pub width: u32,
+    pub height: u32,
+    pub block: crate::snapshot::AstcBlock,
+    /// Level 0 only. The rest of the chain is there in the file but Metal
+    /// wants each level uploaded on its own, and nothing here needs them yet.
+    pub level0: std::ops::Range<usize>,
+}
+
+/// Reads the header rather than decoding anything: these are ASTC blocks the
+/// GPU samples directly, and decoding them would undo the compression.
+///
+/// Returns None for anything that is not uncompressed ASTC 4x4/6x6/8x8 --
+/// including a supercompressed file, which would need inflating first.
+pub fn parse_ktx2(data: &[u8]) -> Option<Ktx2> {
+    const MAGIC: &[u8; 12] = b"\xabKTX 20\xbb\r\n\x1a\n";
+    if data.len() < 80 || &data[..12] != MAGIC {
+        return None;
+    }
+    let u32_at = |o: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(data.get(o..o + 4)?.try_into().ok()?))
+    };
+    let u64_at = |o: usize| -> Option<u64> {
+        Some(u64::from_le_bytes(data.get(o..o + 8)?.try_into().ok()?))
+    };
+
+    let vk_format = u32_at(12)?;
+    let width = u32_at(20)?;
+    let height = u32_at(24)?;
+    let level_count = u32_at(44)?.max(1);
+    let supercompression = u32_at(48)?;
+    if supercompression != 0 {
+        return None;
+    }
+
+    // VK_FORMAT_ASTC_*_{UNORM,SRGB}_BLOCK, which run in pairs from 157.
+    let block = match vk_format {
+        157 => crate::snapshot::AstcBlock::B4x4 { srgb: false },
+        158 => crate::snapshot::AstcBlock::B4x4 { srgb: true },
+        165 => crate::snapshot::AstcBlock::B6x6 { srgb: false },
+        166 => crate::snapshot::AstcBlock::B6x6 { srgb: true },
+        171 => crate::snapshot::AstcBlock::B8x8 { srgb: false },
+        172 => crate::snapshot::AstcBlock::B8x8 { srgb: true },
+        _ => return None,
+    };
+
+    // The level index starts after the 80-byte header, three u64 per level,
+    // and level 0 is the full-size one.
+    let index = 80usize;
+    if data.len() < index + level_count as usize * 24 {
+        return None;
+    }
+    let offset = u64_at(index)? as usize;
+    let length = u64_at(index + 8)? as usize;
+    if offset + length > data.len() {
+        return None;
+    }
+    Some(Ktx2 { width, height, block, level0: offset..offset + length })
+}
