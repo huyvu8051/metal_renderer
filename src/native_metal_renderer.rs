@@ -1373,6 +1373,9 @@ fn draw_generic_ui_nodes(
 }
 
 struct RealGameMeshDraw<'a> {
+    /// Skipped by the scope pass: the gun is not part of the world the scope
+    /// is looking at, and drawn there it shows up inside its own eyepiece.
+    viewmodel: bool,
     vertex_buffer: metal::Buffer,
     index_buffer: metal::Buffer,
     index_count: usize,
@@ -1940,6 +1943,7 @@ impl NativeMetalRenderer {
         light_view_projection: [[f32; 4]; 4],
         point_light_view_projection: [[f32; 4]; 4],
         camera_pos: [f32; 3],
+        skip_viewmodel: bool,
     ) {
         let shadows_on = self.shadow_quality_requested > 0;
         let sponza_pipeline = match (msaa_enabled, shadows_on) {
@@ -2004,7 +2008,7 @@ impl NativeMetalRenderer {
 
             encoder.set_render_pipeline_state(sponza_pipeline.unwrap());
             encoder.set_fragment_sampler_state(0, Some(&self.sponza_sampler));
-            for m in meshes.iter().filter(|m| !m.is_blend) {
+            for m in meshes.iter().filter(|m| !m.is_blend && !(skip_viewmodel && m.viewmodel)) {
                 draw_static_mesh(m);
             }
         }
@@ -2093,7 +2097,10 @@ impl NativeMetalRenderer {
 
         if let Some(meshes) = real_game_meshes {
 
-            let mut blended: Vec<&RealGameMeshDraw> = meshes.iter().filter(|m| m.is_blend).collect();
+            let mut blended: Vec<&RealGameMeshDraw> = meshes
+                .iter()
+                .filter(|m| m.is_blend && !(skip_viewmodel && m.viewmodel))
+                .collect();
             blended.sort_by(|a, b| b.camera_dist_sq.total_cmp(&a.camera_dist_sq));
             if !blended.is_empty() {
                 encoder.set_depth_stencil_state(&self.blend_depth_state);
@@ -2485,6 +2492,7 @@ impl NativeMetalRenderer {
                     mesh.transform.translation.z - self.camera_position[2],
                 ];
                 Some(RealGameMeshDraw {
+                    viewmodel: mesh.viewmodel,
                     vertex_buffer,
                     index_buffer,
                     index_count,
@@ -2673,6 +2681,7 @@ impl NativeMetalRenderer {
                 light_view_projection,
                 point_light_view_projection,
                 self.camera_position,
+                true,
             );
             scope_encoder.end_encoding();
             scope_command_buffer.commit();
@@ -2716,6 +2725,7 @@ impl NativeMetalRenderer {
             light_view_projection,
             point_light_view_projection,
             self.camera_position,
+            false,
         );
 
         if show_scope {
@@ -2736,6 +2746,12 @@ impl NativeMetalRenderer {
                     )
                 });
                 let quad_buffer = real_game_quad_buffer.as_ref().unwrap_or(&self.quad_vertex_buffer);
+                // The scope picture is a composite, not geometry: it sits
+                // where the lens is, which is inside the scope tube, so a
+                // depth test against the scene loses to the gun's own body
+                // and the lens reads black once the weapon is fully raised.
+                // Inheriting the scene's depth state is what did that.
+                encoder.set_depth_stencil_state(&self.ui_depth_state);
                 encoder.set_render_pipeline_state(quad_pipeline);
                 encoder.set_vertex_buffer(0, Some(quad_buffer), 0);
                 encoder.set_fragment_texture(0, Some(&self.scope_color_texture));

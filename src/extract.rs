@@ -35,6 +35,10 @@ pub type MeshExtractParams<'w, 's, F> = (
             &'static MeshMaterial3d<StandardMaterial>,
             &'static GlobalTransform,
             &'static InheritedVisibility,
+            // The windowed build keeps the weapon and hands on their own
+            // layer; the scope has to be told the same thing or it renders
+            // the gun inside its own eyepiece.
+            Option<&'static bevy::camera::visibility::RenderLayers>,
         ),
         F,
     >,
@@ -87,7 +91,19 @@ pub fn decode_texture(
             });
             std::sync::Arc::from(data.as_slice())
         }
-        _ => return None,
+        other => {
+            // Named once per format rather than per frame: a texture silently
+            // dropped here shows up as a grey mesh and nothing else.
+            use std::sync::Mutex;
+            static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+            let name = format!("{other:?}");
+            let mut seen = SEEN.lock().unwrap();
+            if !seen.contains(&name) {
+                eprintln!("[extract] no path for texture format {name}, drawing untextured");
+                seen.push(name);
+            }
+            return None;
+        }
     };
     let extracted = ExtractedTexture {
         id: handle.id(),
@@ -115,12 +131,13 @@ pub fn store_extracted_mesh(
     texture_cache: &mut DecodedTextureCache,
     used_texture_ids: &mut std::collections::HashSet<AssetId<Image>>,
     geometry_already_uploaded: &impl Fn(AssetId<Mesh>) -> bool,
+    viewmodel: bool,
 ) {
     let slot = cache.slot_of.get(&entity).copied();
     let previous = slot.and_then(|slot| cache.entries.get(slot));
     let Some((extracted, textures_pending)) = extract_one_mesh(
         mesh3d, material3d, transform, visibility, meshes, materials, images,
-        texture_cache, used_texture_ids, geometry_already_uploaded, previous,
+        texture_cache, used_texture_ids, geometry_already_uploaded, previous, viewmodel,
     ) else {
         return;
     };
@@ -156,6 +173,7 @@ pub fn extract_one_mesh(
     used_texture_ids: &mut std::collections::HashSet<AssetId<Image>>,
     geometry_already_uploaded: &impl Fn(AssetId<Mesh>) -> bool,
     previous: Option<&ExtractedMesh>,
+    viewmodel: bool,
 ) -> Option<(ExtractedMesh, bool)> {
     let material = materials.get(&material3d.0)?;
     let mesh_id = mesh3d.id();
@@ -206,6 +224,7 @@ pub fn extract_one_mesh(
         || has_tangents && material.normal_map_texture.is_some() && normal_texture.is_none();
 
     Some((ExtractedMesh {
+        viewmodel,
         positions,
         normals,
         uvs,

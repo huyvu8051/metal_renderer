@@ -51,6 +51,11 @@ pub struct ExtractedMesh {
     pub transform: Transform,
 
     pub visible: bool,
+    /// True for the weapon and the hands -- what the windowed build keeps on
+    /// its own render layer. The scope renders the world from a second point
+    /// of view, and the gun is not part of that world: drawn there it appears
+    /// inside its own eyepiece.
+    pub viewmodel: bool,
 
     pub is_blend: bool,
 
