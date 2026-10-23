@@ -8,7 +8,7 @@ edition = "2024"
 [dependencies]
 bevy = { version = "0.19", features = ["jpeg"] }
 
-[target.'cfg(target_os = "ios")'.dependencies]
+[target.'cfg(target_vendor = "apple")'.dependencies]
 objc = "0.2"
 core-graphics = "0.25"
 metal = "0.33.0"
