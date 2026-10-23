@@ -16,6 +16,20 @@ pub struct GltfVertex {
     pub tangent: [f32; 4],
 }
 
+/// The whole map in one vertex buffer and one index buffer, each mesh an
+/// offset into them.
+///
+/// One buffer per mesh was worth measuring and was worth 0.44 ms a frame on
+/// desert_city's 2363 primitives. The driver keeps an NSMutableSet of the
+/// resources resident on an encoder, so every *distinct* buffer is a hash and
+/// an insert; `sample` showed IOGPUResourceListAddResource and __rehashs near
+/// the top of the profile, and both vanish once there is only one of each.
+pub struct GltfScene {
+    pub vertices: metal::Buffer,
+    pub indices: metal::Buffer,
+    pub meshes: Vec<GltfMesh>,
+}
+
 pub struct GltfMesh {
     pub emissive: [f32; 4],
     /// From the material's `alphaMode`. The ECS path reads this too, and a
@@ -25,9 +39,16 @@ pub struct GltfMesh {
     /// World-space centre, for sorting the transparent draws back to front.
     pub centre: [f32; 3],
     /// Reported so the two loaders' vertex counts can be compared.
+    /// Distance from `centre` to the furthest vertex. Measured here because
+    /// the walk already has the positions in hand, and a frustum test needs a
+    /// radius as much as it needs a centre.
+    pub radius: f32,
     pub vertex_count: usize,
-    pub vertex_buffer: metal::Buffer,
-    pub index_buffer: metal::Buffer,
+    /// Byte offsets into [`GltfScene`]'s two buffers. Indices stay relative to
+    /// the mesh's own first vertex, which is what binding the vertex buffer at
+    /// an offset already means.
+    pub vertex_offset: u64,
+    pub index_offset: u64,
     pub index_count: usize,
     pub base_color_texture: Option<metal::Texture>,
     pub base_color_factor: [f32; 4],
@@ -122,8 +143,9 @@ fn walk_node(
     parent_transform: Mat4,
     buffers: &[gltf::buffer::Data],
     textures: &[Option<metal::Texture>],
-    device: &Device,
     meshes: &mut Vec<GltfMesh>,
+    vertex_bytes: &mut Vec<u8>,
+    index_bytes: &mut Vec<u8>,
 ) {
     let (t, r, s) = node.transform().decomposed();
     let local = mat4_from_quat_translation_scale(t, r, s);
@@ -164,39 +186,57 @@ fn walk_node(
                 })
                 .collect();
 
-            let vertex_buffer = device.new_buffer_with_data(
-                vertices.as_ptr() as *const _,
-                (vertices.len() * std::mem::size_of::<GltfVertex>()) as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
-            let index_buffer = device.new_buffer_with_data(
-                indices.as_ptr() as *const _,
-                (indices.len() * std::mem::size_of::<u32>()) as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
+            let vertex_offset = vertex_bytes.len() as u64;
+            let index_offset = index_bytes.len() as u64;
+            vertex_bytes.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(
+                    vertices.as_ptr() as *const u8,
+                    vertices.len() * std::mem::size_of::<GltfVertex>(),
+                )
+            });
+            index_bytes.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(
+                    indices.as_ptr() as *const u8,
+                    indices.len() * std::mem::size_of::<u32>(),
+                )
+            });
 
             let pbr = primitive.material().pbr_metallic_roughness();
             let base_color_texture = pbr
                 .base_color_texture()
                 .and_then(|info| textures.get(info.texture().source().index()).cloned().flatten());
 
+            let centre = {
+                let mut sum = [0.0f64; 3];
+                for v in &vertices {
+                    sum[0] += v.position[0] as f64;
+                    sum[1] += v.position[1] as f64;
+                    sum[2] += v.position[2] as f64;
+                }
+                let n = vertices.len().max(1) as f64;
+                [(sum[0] / n) as f32, (sum[1] / n) as f32, (sum[2] / n) as f32]
+            };
+            let radius = vertices
+                .iter()
+                .map(|v| {
+                    let d = [
+                        v.position[0] - centre[0],
+                        v.position[1] - centre[1],
+                        v.position[2] - centre[2],
+                    ];
+                    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+                })
+                .fold(0.0f32, f32::max);
+
             meshes.push(GltfMesh {
                 vertex_count: vertices.len(),
-                vertex_buffer,
-                index_buffer,
+                vertex_offset,
+                index_offset,
+                radius,
                 index_count: indices.len(),
                 base_color_texture,
                 base_color_factor: pbr.base_color_factor(),
-                centre: {
-                    let mut sum = [0.0f64; 3];
-                    for v in &vertices {
-                        sum[0] += v.position[0] as f64;
-                        sum[1] += v.position[1] as f64;
-                        sum[2] += v.position[2] as f64;
-                    }
-                    let n = vertices.len().max(1) as f64;
-                    [(sum[0] / n) as f32, (sum[1] / n) as f32, (sum[2] / n) as f32]
-                },
+                centre,
                 is_blend: matches!(
                     primitive.material().alpha_mode(),
                     gltf::material::AlphaMode::Blend
@@ -210,16 +250,16 @@ fn walk_node(
     }
 
     for child in node.children() {
-        walk_node(&child, world, buffers, textures, device, meshes);
+        walk_node(&child, world, buffers, textures, meshes, vertex_bytes, index_bytes);
     }
 }
 
-pub fn load_gltf_scene(device: &Device, path: &std::path::Path) -> Vec<GltfMesh> {
+pub fn load_gltf_scene(device: &Device, path: &std::path::Path) -> GltfScene {
     let (document, buffers, images) = match gltf::import(path) {
         Ok(result) => result,
         Err(err) => {
             eprintln!("[gltf_scene] failed to load {path:?}: {err}");
-            return Vec::new();
+            return GltfScene::empty(device);
         }
     };
 
@@ -231,12 +271,22 @@ pub fn load_gltf_scene(device: &Device, path: &std::path::Path) -> Vec<GltfMesh>
         .collect();
 
     let mut meshes = Vec::new();
+    let mut vertex_bytes: Vec<u8> = Vec::new();
+    let mut index_bytes: Vec<u8> = Vec::new();
     let Some(scene) = document.default_scene().or_else(|| document.scenes().next()) else {
         eprintln!("[gltf_scene] {path:?} has no scenes");
-        return Vec::new();
+        return GltfScene::empty(device);
     };
     for node in scene.nodes() {
-        walk_node(&node, mat4_identity(), &buffers, &textures, device, &mut meshes);
+        walk_node(
+            &node,
+            mat4_identity(),
+            &buffers,
+            &textures,
+            &mut meshes,
+            &mut vertex_bytes,
+            &mut index_bytes,
+        );
     }
     let indices: usize = meshes.iter().map(|m| m.index_count).sum();
     let vertices: usize = meshes.iter().map(|m| m.vertex_count).sum();
@@ -245,5 +295,25 @@ pub fn load_gltf_scene(device: &Device, path: &std::path::Path) -> Vec<GltfMesh>
         meshes.len(),
         textures.len()
     );
-    meshes
+    GltfScene {
+        vertices: new_buffer(device, &vertex_bytes),
+        indices: new_buffer(device, &index_bytes),
+        meshes,
+    }
+}
+
+/// Metal rejects a zero-length buffer, and an empty scene has to stay a valid
+/// one -- the loader already returns early on a bad file.
+fn new_buffer(device: &Device, bytes: &[u8]) -> metal::Buffer {
+    device.new_buffer_with_data(
+        if bytes.is_empty() { [0u8; 4].as_ptr() } else { bytes.as_ptr() } as *const _,
+        bytes.len().max(4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    )
+}
+
+impl GltfScene {
+    fn empty(device: &Device) -> Self {
+        Self { vertices: new_buffer(device, &[]), indices: new_buffer(device, &[]), meshes: Vec::new() }
+    }
 }
