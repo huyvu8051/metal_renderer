@@ -161,8 +161,13 @@ pub fn parse_ktx2(data: &[u8]) -> Option<Ktx2> {
     let vk_format = u32_at(12)?;
     let width = u32_at(20)?;
     let height = u32_at(24)?;
-    let level_count = u32_at(44)?.max(1);
-    let supercompression = u32_at(48)?;
+    // Field order after the 12-byte identifier: vkFormat, typeSize,
+    // pixelWidth, pixelHeight, pixelDepth, layerCount, faceCount, levelCount,
+    // supercompressionScheme -- so levelCount is at 44 from the start of the
+    // file and the scheme at 48. Reading these one field late made every file
+    // look supercompressed and turned every character grey.
+    let level_count = u32_at(12 + 7 * 4)?.max(1);
+    let supercompression = u32_at(12 + 8 * 4)?;
     if supercompression != 0 {
         return None;
     }

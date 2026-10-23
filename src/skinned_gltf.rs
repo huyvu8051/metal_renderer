@@ -352,10 +352,12 @@ pub fn load_skinned_gltf(device: &Device, path: &std::path::Path) -> Option<Skin
     }
 
     eprintln!(
-        "[skinned_gltf] loaded {} meshes, {} joints, {} animations from {path:?}",
+        "[skinned_gltf] loaded {} meshes, {} joints, {} animations, {}/{} textures from {path:?}",
         meshes.len(),
         joint_nodes.len(),
-        animations.len()
+        animations.len(),
+        textures.iter().filter(|t| t.is_some()).count(),
+        textures.len()
     );
 
     Some(SkinnedModel {
