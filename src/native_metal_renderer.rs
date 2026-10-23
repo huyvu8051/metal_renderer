@@ -1016,6 +1016,8 @@ pub struct NativeMetalRenderer {
     real_game_scope_rotation: [f32; 4],
     real_game_scope_active: bool,
     real_game_scope_fov: f32,
+    /// The main view's vertical fov, taken from the snapshot each frame.
+    real_game_fov: f32,
 
     real_game_scope_lens_world_pos: [f32; 3],
 
@@ -1870,6 +1872,7 @@ impl NativeMetalRenderer {
             real_game_scope_rotation: [0.0, 0.0, 0.0, 1.0],
             real_game_scope_active: false,
             real_game_scope_fov: 12.0_f32.to_radians(),
+            real_game_fov: std::f32::consts::FRAC_PI_4,
             real_game_scope_lens_world_pos: [0.0, 0.0, 0.0],
             real_game_scope_lens_local_rotation: [0.0, 0.0, 0.0, 1.0],
             real_game_light: FALLBACK_LIGHT,
@@ -2301,6 +2304,7 @@ impl NativeMetalRenderer {
             self.render_resolution_scale = snapshot.render_resolution_scale.clamp(0.1, 1.0);
             if let Some(cam) = &snapshot.camera {
                 self.camera_position = cam.eye;
+                self.real_game_fov = cam.fov;
                 self.camera_yaw = cam.yaw;
                 self.camera_pitch = cam.pitch;
                 self.real_game_camera_rotation = cam.rotation;
@@ -2530,7 +2534,11 @@ impl NativeMetalRenderer {
         } else {
             look_at([0.0, 3.0, 10.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0])
         };
-        let proj = perspective(if is_real_game { 60.0_f32 } else { 45.0 }.to_radians(), aspect, 0.05, far);
+        let proj = if is_real_game {
+            perspective(self.real_game_fov, aspect, 0.05, far)
+        } else {
+            perspective(45.0_f32.to_radians(), aspect, 0.05, far)
+        };
 
         let light = self.real_game_light;
         let view_projection = mat_mul(proj, view);

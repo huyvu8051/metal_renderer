@@ -62,6 +62,11 @@ pub struct CameraSnapshot {
     pub rotation: [f32; 4],
     pub yaw: f32,
     pub pitch: f32,
+    /// Vertical, radians, straight off the camera's own projection. The
+    /// renderer used to hardcode 60 degrees against the game's 45, which makes
+    /// everything -- the weapon most noticeably -- sit further away than it
+    /// should.
+    pub fov: f32,
 
     pub ads_blend: f32,
 
@@ -163,6 +168,7 @@ impl Default for CameraSnapshot {
             rotation: [0.0, 0.0, 0.0, 1.0],
             yaw: 0.0,
             pitch: 0.0,
+            fov: std::f32::consts::FRAC_PI_4,
             ads_blend: 0.0,
             scope_zoom: 8.0,
             wall_raise: 0.0,
