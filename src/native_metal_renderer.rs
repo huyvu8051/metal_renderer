@@ -1389,6 +1389,12 @@ struct RealGameMeshDraw<'a> {
 
 
 impl NativeMetalRenderer {
+    /// How many joint matrices a pose for `name` has to carry, or 0 if no such
+    /// model was preloaded. A caller that guesses this wrong gets a silently
+    /// wrong pose rather than an error.
+    pub fn skinned_joint_count(&self, name: &str) -> usize {
+        self.skinned_models.get(name).map_or(0, |slot| slot.model.joint_count())
+    }
 
     /// `skinned_models` names the skinned glTF files to preload, as
     /// `(model_name, path_relative_to_assets, scale, y_offset, facing_radians)`.

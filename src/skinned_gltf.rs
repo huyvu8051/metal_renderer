@@ -105,6 +105,13 @@ pub struct SkinnedModel {
     inverse_bind_matrices: Vec<Mat4>,
 }
 
+impl SkinnedModel {
+    /// How many joint matrices a pose for this model has to carry.
+    pub fn joint_count(&self) -> usize {
+        self.joint_nodes.len()
+    }
+}
+
 fn sample_channel(times: &[f32], sample_time: f32) -> (usize, usize, f32) {
     if times.len() < 2 {
         return (0, 0, 0.0);
