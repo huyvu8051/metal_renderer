@@ -1133,6 +1133,8 @@ pub struct NativeMetalRenderer {
     /// read once they have completed.
     last_command_buffers: Vec<(&'static str, metal::CommandBuffer)>,
     shadow_quality_requested: u8,
+    shadow_static: bool,
+    shadow_dynamic: bool,
     frame_capture: Option<super::gpu_capture::FrameCapture>,
 }
 
@@ -2228,6 +2230,8 @@ impl NativeMetalRenderer {
             force_opaque: false,
             last_command_buffers: Vec::new(),
             shadow_quality_requested: 0,
+            shadow_static: true,
+            shadow_dynamic: true,
             frame_capture,
         }
     }
@@ -2577,7 +2581,7 @@ impl NativeMetalRenderer {
         extracted: &[super::skinned_actor::SkinnedActorDraw],
         real_game_meshes: Option<&[RealGameMeshDraw]>,
     ) {
-        if let Some(meshes) = real_game_meshes {
+        if let Some(meshes) = real_game_meshes.filter(|_| self.shadow_static) {
             if let Some(pipeline) = self.shadow_pipeline_sponza.as_ref() {
                 encoder.set_render_pipeline_state(pipeline);
                 // The light's frustum, not the camera's: a wall behind the
@@ -2602,6 +2606,9 @@ impl NativeMetalRenderer {
             }
         }
 
+        if !self.shadow_dynamic {
+            return;
+        }
         let Some(pipeline) = self.shadow_pipeline_skinned.as_ref() else { return };
         encoder.set_render_pipeline_state(pipeline);
         for actor in extracted {
@@ -2698,6 +2705,8 @@ impl NativeMetalRenderer {
             self.msaa_enabled = snapshot.map_msaa_on;
             self.ensure_shadow_map_size(snapshot.shadow_quality);
             self.shadow_quality_requested = snapshot.shadow_quality;
+            self.shadow_static = snapshot.shadow_static;
+            self.shadow_dynamic = snapshot.shadow_dynamic;
             self.render_resolution_scale = snapshot.render_resolution_scale.clamp(0.1, 1.0);
             if let Some(cam) = &snapshot.camera {
                 self.camera_position = cam.eye;

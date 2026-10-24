@@ -112,6 +112,17 @@ pub struct RenderSnapshot {
     pub map_msaa_on: bool,
 
     pub shadow_quality: u8,
+    /// Whether the map casts into the shadow map at runtime.
+    ///
+    /// Separate from the dynamic flag because the two are no longer the same
+    /// question. The map's own shadows are baked -- the lightmap's green
+    /// channel says whether the sun reaches each texel, and the probe grid
+    /// says the same for anything standing in the air -- so re-casting static
+    /// geometry every frame mostly repeats work that is already in a texture.
+    pub shadow_static: bool,
+    /// Whether zombies, the player and the weapon cast. This one cannot be
+    /// baked: a shadow that moves is not a property of the map.
+    pub shadow_dynamic: bool,
 
     pub light_quality: u8,
 
