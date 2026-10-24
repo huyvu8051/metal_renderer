@@ -140,6 +140,10 @@ pub fn store_extracted_mesh(
     geometry_already_uploaded: &impl Fn(AssetId<Mesh>) -> bool,
     viewmodel: bool,
     reticle: bool,
+    // Runs on the finished mesh before it is cached. The host uses it to
+    // attach the map's baked lightmap, which this crate knows nothing about --
+    // it is not in the glTF and not in any Bevy component.
+    decorate: &impl Fn(&mut ExtractedMesh),
 ) {
     let slot = cache.slot_of.get(&entity).copied();
     let previous = slot.and_then(|slot| cache.entries.get(slot));
@@ -149,6 +153,8 @@ pub fn store_extracted_mesh(
     ) else {
         return;
     };
+    let mut extracted = extracted;
+    decorate(&mut extracted);
     if textures_pending {
         cache.awaiting_textures.insert(entity);
     } else {
@@ -233,6 +239,9 @@ pub fn extract_one_mesh(
         || has_tangents && material.normal_map_texture.is_some() && normal_texture.is_none();
 
     Some((ExtractedMesh {
+        // Filled in afterwards by whoever has the baked atlas; the glTF knows
+        // nothing about it.
+        uv2: Vec::new(),
         viewmodel,
         reticle,
         positions,

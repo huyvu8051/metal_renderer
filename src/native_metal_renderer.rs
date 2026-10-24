@@ -146,6 +146,7 @@ struct Vertex {
     // comment (gltf_scene.rs) for where this gets baked (CPU-side, world
     // space, same as position/normal above).
     packed_float4 tangent;
+    packed_float2 uv2;
 };
 
 struct Uniforms {
@@ -178,6 +179,7 @@ struct VertexOut {
     float3 normal;
     float2 uv;
     float4 tangent;
+    float2 uv2;
 };
 
 vertex VertexOut sponza_vertex(uint vid [[vertex_id]],
@@ -196,6 +198,7 @@ vertex VertexOut sponza_vertex(uint vid [[vertex_id]],
     // vertices/bake_local_mesh_vertices already use for tangent.w.
     float3 rotatedTangent = (uniforms.modelMatrix * float4(v.tangent.xyz, 0.0)).xyz;
     out.tangent = float4(rotatedTangent, v.tangent.w);
+    out.uv2 = float2(v.uv2);
     return out;
 }
 
@@ -244,7 +247,8 @@ fragment float4 sponza_fragment(VertexOut in [[stage_in]],
                                  depth2d<float> shadowMap [[texture(1)]],
                                  sampler shadowSampler [[sampler(1)]],
                                  depth2d<float> pointShadowMap [[texture(2)]],
-                                 texture2d<float> normalTexture [[texture(3)]]) {
+                                 texture2d<float> normalTexture [[texture(3)]],
+                                 texture2d<float> lightmap [[texture(4)]]) {
 #if FEATURE_FLAT
     return float4(0.6, 0.6, 0.6, 1.0);
 #else
@@ -330,7 +334,25 @@ fragment float4 sponza_fragment(VertexOut in [[stage_in]],
 
     float4 texColor = baseColorTexture.sample(texSampler, in.uv);
     float4 baseColor = texColor * uniforms.baseColorFactor;
-    float3 lit = baseColor.rgb * (0.35 + 0.65 * diffuseTerm) + specularTerm;
+
+    // The 0.35 this replaces was the whole of indirect light: a corner and an
+    // open wall were handed the same fill. R is baked ambient occlusion, G is
+    // whether the sun reaches here at all.
+    //
+    // uv2 is exactly zero for anything the bake did not cover -- unmapped
+    // geometry, and every mesh that is not the map. Those keep the old
+    // constant rather than reading texel zero, which is a corner of the atlas
+    // and means nothing.
+    float ambient = 0.35;
+    float sunMask = 1.0;
+    if (in.uv2.x > 0.0 || in.uv2.y > 0.0) {
+        float2 baked = lightmap.sample(texSampler, in.uv2).rg;
+        // Not all the way to black. Occlusion this strong is geometry a metre
+        // away, not a sealed box, and a floor that reads zero is a hole.
+        ambient = mix(0.06, 0.42, baked.r);
+        sunMask = baked.g;
+    }
+    float3 lit = baseColor.rgb * (ambient + 0.65 * diffuseTerm * sunMask) + specularTerm * sunMask;
     // Additive — no real Bloom pass exists in this renderer (see
     // ExtractedMesh::emissive's own doc comment for why these values are
     // authored well above 1.0), but adding the raw emissive term straight
@@ -522,6 +544,9 @@ struct SponzaVertex {
     // — position/normal/uv would land right, but every vertex AFTER the
     // first would already be reading from the wrong offset.
     packed_float4 tangent;
+    // Mirrors GltfVertex, which grew a lightmap uv. Unused in this pass but
+    // the stride has to match or every vertex after the first is read short.
+    packed_float2 uv2;
 };
 
 struct SponzaShadowUniforms {
@@ -1017,6 +1042,9 @@ pub struct NativeMetalRenderer {
     real_game_scope_active: bool,
     screen_capture: Option<crate::screen_capture::ScreenCapture>,
     joint_ring: JointRing,
+    /// The map's baked ambient occlusion and sun visibility. One texture for
+    /// the whole map, supplied by the host -- nothing in the glTF carries it.
+    lightmap: Option<metal::Texture>,
     real_game_scope_fov: f32,
     /// The main view's vertical fov, taken from the snapshot each frame.
     real_game_fov: f32,
@@ -1063,7 +1091,8 @@ fn bake_local_mesh_vertices(mesh: &ExtractedMesh) -> (Vec<super::gltf_scene::Glt
         let normal = if mesh.normals.is_empty() { [0.0, 1.0, 0.0] } else { mesh.normals[idx] };
         let uv = if mesh.uvs.is_empty() { [0.0, 0.0] } else { mesh.uvs[idx] };
         let tangent = if mesh.tangents.is_empty() { [1.0, 0.0, 0.0, 1.0] } else { mesh.tangents[idx] };
-        super::gltf_scene::GltfVertex { position, normal, uv, tangent }
+        let uv2 = if mesh.uv2.is_empty() { [0.0, 0.0] } else { mesh.uv2[idx] };
+        super::gltf_scene::GltfVertex { position, normal, uv, tangent, uv2 }
     };
     let verts: Vec<_> = (0..mesh.positions.len()).map(vertex_at).collect();
     let indices = if mesh.indices.is_empty() {
@@ -1478,6 +1507,27 @@ struct RealGameMeshDraw<'a> {
 
 
 impl NativeMetalRenderer {
+    /// Hands over the map's baked lightmap. RGBA8 bytes, R ambient occlusion
+    /// and G sun visibility, square and `size` on a side.
+    pub fn set_lightmap(&mut self, rgba: &[u8], size: u32) {
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(size as u64);
+        descriptor.set_height(size as u64);
+        descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+        descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+        let texture = self.device.new_texture(&descriptor);
+        texture.replace_region(
+            metal::MTLRegion {
+                origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                size: metal::MTLSize { width: size as u64, height: size as u64, depth: 1 },
+            },
+            0,
+            rgba.as_ptr() as *const _,
+            (size * 4) as u64,
+        );
+        self.lightmap = Some(texture);
+    }
+
     /// How many joint matrices a pose for `name` has to carry, or 0 if no such
     /// model was preloaded. A caller that guesses this wrong gets a silently
     /// wrong pose rather than an error.
@@ -1961,6 +2011,7 @@ impl NativeMetalRenderer {
             real_game_scope_active: false,
             screen_capture: crate::screen_capture::ScreenCapture::from_env(),
             joint_ring,
+            lightmap: None,
             real_game_scope_fov: 12.0_f32.to_radians(),
             real_game_fov: std::f32::consts::FRAC_PI_4,
             real_game_scope_lens_world_pos: [0.0, 0.0, 0.0],
@@ -2098,6 +2149,12 @@ impl NativeMetalRenderer {
 
             encoder.set_render_pipeline_state(sponza_pipeline.unwrap());
             encoder.set_fragment_sampler_state(0, Some(&self.sponza_sampler));
+            // Bound once for the pass, not per mesh: it is one texture for the
+            // whole map. Falls back to the white texture so the sample is
+            // defined even before the host has handed one over -- the shader
+            // skips it on uv2 being zero, but an unbound slot is undefined
+            // behaviour rather than a defined white.
+            encoder.set_fragment_texture(4, Some(self.lightmap.as_deref().unwrap_or(&self.white_texture)));
             for m in meshes.iter().filter(|m| !m.is_blend && draws_in_pass(m, scope_pass)) {
                 draw_static_mesh(m);
             }

@@ -14,6 +14,10 @@ pub struct GltfVertex {
     pub uv: [f32; 2],
 
     pub tangent: [f32; 4],
+    /// Lightmap coordinates, already normalised to 0..1 by the baker. Zero for
+    /// anything the bake did not cover, which the shader reads as "no lightmap
+    /// here" and falls back to the flat ambient term.
+    pub uv2: [f32; 2],
 }
 
 /// The whole map in one vertex buffer and one index buffer, each mesh an
@@ -178,6 +182,9 @@ fn walk_node(
                 .map(|i| {
                     let tangent = transform_direction(world, [tangents[i][0], tangents[i][1], tangents[i][2]]);
                     GltfVertex {
+                        // Skinned and scene glTFs carry no lightmap; only the
+                        // map does, and it comes in through the host.
+                        uv2: [0.0, 0.0],
                         position: transform_point(world, positions[i]),
                         normal: transform_direction(world, normals[i]),
                         uv: uvs[i],

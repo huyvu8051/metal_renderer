@@ -37,6 +37,9 @@ pub struct ExtractedMesh {
     pub normals: Vec<[f32; 3]>,
 
     pub uvs: Vec<[f32; 2]>,
+    /// Lightmap coordinates, one per vertex, or empty. Filled in by the host
+    /// from the map's baked atlas -- nothing in the glTF carries it.
+    pub uv2: Vec<[f32; 2]>,
 
     pub indices: Vec<u32>,
     pub base_color: [f32; 4],
