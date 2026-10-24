@@ -1016,6 +1016,7 @@ pub struct NativeMetalRenderer {
     real_game_scope_rotation: [f32; 4],
     real_game_scope_active: bool,
     screen_capture: Option<crate::screen_capture::ScreenCapture>,
+    joint_ring: JointRing,
     real_game_scope_fov: f32,
     /// The main view's vertical fov, taken from the snapshot each frame.
     real_game_fov: f32,
@@ -1393,6 +1394,64 @@ fn capture_if_due(
 
 fn draws_in_pass(mesh: &RealGameMeshDraw, scope_pass: bool) -> bool {
     if scope_pass { !mesh.viewmodel } else { !mesh.reticle }
+}
+
+
+/// Joint matrices for every skinned actor, in one resident buffer per frame
+/// in flight rather than a fresh `MTLBuffer` per actor per pass.
+///
+/// An allocation is not just a malloc here: the driver keeps a set of
+/// resident resources and every new buffer is a hash and an insert into it,
+/// with the old one left for ARC. At thirty zombies, two passes and 120 Hz
+/// that was running seven thousand times a second to move a few kilobytes.
+///
+/// Three buffers, cycled, because the GPU is still reading the previous
+/// frame's matrices while the CPU writes the next.
+struct JointRing {
+    buffers: Vec<metal::Buffer>,
+    capacity: u64,
+    frame: std::cell::Cell<usize>,
+    cursor: std::cell::Cell<u64>,
+}
+
+const JOINT_RING_FRAMES: usize = 3;
+/// Offsets handed to setVertexBuffer stay 256-aligned: the device address
+/// space only asks for 4, but 256 is what every address space accepts.
+const JOINT_RING_ALIGN: u64 = 256;
+
+impl JointRing {
+    fn new(device: &metal::DeviceRef, capacity: u64) -> Self {
+        let buffers = (0..JOINT_RING_FRAMES)
+            .map(|_| device.new_buffer(capacity, MTLResourceOptions::StorageModeShared))
+            .collect();
+        Self { buffers, capacity, frame: std::cell::Cell::new(0), cursor: std::cell::Cell::new(0) }
+    }
+
+    fn begin_frame(&self) {
+        self.frame.set((self.frame.get() + 1) % JOINT_RING_FRAMES);
+        self.cursor.set(0);
+    }
+
+    /// `None` when this frame's buffer is full, which leaves the caller to
+    /// allocate: correctness first, and a frame that overflows is one whose
+    /// capacity was guessed too low rather than one that should drop actors.
+    fn push(&self, matrices: &[[[f32; 4]; 4]]) -> Option<(&metal::BufferRef, u64)> {
+        let bytes = std::mem::size_of_val(matrices) as u64;
+        let offset = self.cursor.get();
+        if offset + bytes > self.capacity {
+            return None;
+        }
+        let buffer = &self.buffers[self.frame.get()];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                matrices.as_ptr() as *const u8,
+                (buffer.contents() as *mut u8).add(offset as usize),
+                bytes as usize,
+            );
+        }
+        self.cursor.set((offset + bytes).div_ceil(JOINT_RING_ALIGN) * JOINT_RING_ALIGN);
+        Some((buffer.as_ref(), offset))
+    }
 }
 
 struct RealGameMeshDraw<'a> {
@@ -1841,6 +1900,7 @@ impl NativeMetalRenderer {
         ui_sampler_descriptor.set_address_mode_t(metal::MTLSamplerAddressMode::ClampToEdge);
         let ui_sampler = device.new_sampler(&ui_sampler_descriptor);
         let font_atlas_texture = build_font_atlas(&device);
+        let joint_ring = JointRing::new(&device, 1 << 20);
 
         Self {
             device,
@@ -1900,6 +1960,7 @@ impl NativeMetalRenderer {
             real_game_scope_rotation: [0.0, 0.0, 0.0, 1.0],
             real_game_scope_active: false,
             screen_capture: crate::screen_capture::ScreenCapture::from_env(),
+            joint_ring,
             real_game_scope_fov: 12.0_f32.to_radians(),
             real_game_fov: std::f32::consts::FRAC_PI_4,
             real_game_scope_lens_world_pos: [0.0, 0.0, 0.0],
@@ -2078,11 +2139,18 @@ impl NativeMetalRenderer {
             if joint_matrices.is_empty() {
                 continue;
             }
-            let joint_buffer = self.device.new_buffer_with_data(
-                joint_matrices.as_ptr() as *const _,
-                (joint_matrices.len() * std::mem::size_of::<[[f32; 4]; 4]>()) as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
+            let fallback;
+            let (joint_buffer, joint_offset) = match self.joint_ring.push(&joint_matrices) {
+                Some(slot) => slot,
+                None => {
+                    fallback = self.device.new_buffer_with_data(
+                        joint_matrices.as_ptr() as *const _,
+                        std::mem::size_of_val(joint_matrices.as_slice()) as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    (fallback.as_ref(), 0)
+                }
+            };
 
             for mesh in &model.meshes {
                 let skinned_uniforms = SkinnedUniforms {
@@ -2101,7 +2169,7 @@ impl NativeMetalRenderer {
                     _camera_pad: 0.0,
                 };
                 encoder.set_vertex_buffer(0, Some(&mesh.vertex_buffer), 0);
-                encoder.set_vertex_buffer(2, Some(&joint_buffer), 0);
+                encoder.set_vertex_buffer(2, Some(joint_buffer), joint_offset);
                 encoder.set_vertex_bytes(
                     1,
                     std::mem::size_of::<SkinnedUniforms>() as u64,
@@ -2282,15 +2350,22 @@ impl NativeMetalRenderer {
             if joint_matrices.is_empty() {
                 continue;
             }
-            let joint_buffer = self.device.new_buffer_with_data(
-                joint_matrices.as_ptr() as *const _,
-                (joint_matrices.len() * std::mem::size_of::<[[f32; 4]; 4]>()) as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
+            let fallback;
+            let (joint_buffer, joint_offset) = match self.joint_ring.push(&joint_matrices) {
+                Some(slot) => slot,
+                None => {
+                    fallback = self.device.new_buffer_with_data(
+                        joint_matrices.as_ptr() as *const _,
+                        std::mem::size_of_val(joint_matrices.as_slice()) as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    (fallback.as_ref(), 0)
+                }
+            };
             for mesh in &model.meshes {
                 let uniforms = SkinnedShadowUniforms { light_view_projection, model_matrix };
                 encoder.set_vertex_buffer(0, Some(&mesh.vertex_buffer), 0);
-                encoder.set_vertex_buffer(2, Some(&joint_buffer), 0);
+                encoder.set_vertex_buffer(2, Some(joint_buffer), joint_offset);
                 encoder.set_vertex_bytes(1, std::mem::size_of::<SkinnedShadowUniforms>() as u64, &uniforms as *const _ as *const _);
                 encoder.draw_indexed_primitives(
                     MTLPrimitiveType::Triangle,
@@ -2319,6 +2394,7 @@ impl NativeMetalRenderer {
     }
 
     pub fn render_frame(&mut self, snapshot: RenderSnapshot) -> FrameTimings {
+        self.joint_ring.begin_frame();
         let mut timings = FrameTimings::default();
         self.sync_drawable_size();
         let drawable_size = self.layer.drawable_size();
