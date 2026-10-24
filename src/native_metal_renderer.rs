@@ -1071,8 +1071,13 @@ pub struct NativeMetalRenderer {
 
     real_game_textures: std::collections::HashMap<AssetId<Image>, metal::Texture>,
 
-    gpu_transformed_mesh_cache:
-        std::collections::HashMap<AssetId<Mesh>, (metal::Buffer, metal::Buffer, usize, usize)>,
+    /// Buffers, counts, and the mesh's own bounding sphere. The sphere lives
+    /// with the geometry because that is the only time the positions are in
+    /// hand -- an already-uploaded mesh arrives with its position list empty.
+    gpu_transformed_mesh_cache: std::collections::HashMap<
+        AssetId<Mesh>,
+        (metal::Buffer, metal::Buffer, usize, usize, [f32; 3], f32),
+    >,
 
     real_game_camera_rotation: [f32; 4],
 
@@ -1085,6 +1090,9 @@ pub struct NativeMetalRenderer {
     real_game_scope_active: bool,
     screen_capture: Option<crate::screen_capture::ScreenCapture>,
     joint_ring: JointRing,
+    /// Kept so the cull count can be reported against the same planes the
+    /// scene pass used. A Cell because draw_scene only has &self.
+    last_main_view_projection: std::cell::Cell<[[f32; 4]; 4]>,
     /// The map's baked ambient occlusion and sun visibility. One texture for
     /// the whole map, supplied by the host -- nothing in the glTF carries it.
     lightmap: Option<metal::Texture>,
@@ -1475,6 +1483,18 @@ fn draws_in_pass(mesh: &RealGameMeshDraw, scope_pass: bool) -> bool {
     if scope_pass { !mesh.viewmodel } else { !mesh.reticle }
 }
 
+/// Layer filter and frustum test together, so no caller can remember one and
+/// forget the other.
+///
+/// The viewmodel is exempt: it is positioned relative to the camera and sits
+/// inside the near plane, where a conservative sphere test rejects it.
+fn draws_in_view(mesh: &RealGameMeshDraw, scope_pass: bool, planes: &[[f32; 4]; 6]) -> bool {
+    draws_in_pass(mesh, scope_pass)
+        && (mesh.viewmodel
+            || mesh.reticle
+            || !sphere_outside(planes, mesh.bounds_centre, mesh.bounds_radius))
+}
+
 
 /// Joint matrices for every skinned actor, in one resident buffer per frame
 /// in flight rather than a fresh `MTLBuffer` per actor per pass.
@@ -1533,6 +1553,73 @@ impl JointRing {
     }
 }
 
+/// The six planes of a view-projection, each `ax + by + cz + d = 0` with the
+/// inside positive.
+///
+/// Gribb-Hartmann: the rows of the matrix already describe the clip volume, so
+/// the planes fall out of adding and subtracting them. No inverse, no corner
+/// reconstruction.
+fn frustum_planes(view_projection: [[f32; 4]; 4]) -> [[f32; 4]; 6] {
+    let m = |row: usize, col: usize| view_projection[col][row];
+    let mut planes = [[0.0f32; 4]; 6];
+    for (index, (row, sign)) in [(0, 1.0), (0, -1.0), (1, 1.0), (1, -1.0), (2, 1.0), (2, -1.0)]
+        .into_iter()
+        .enumerate()
+    {
+        // Metal clips z to 0..w, not -w..w, so the near plane is row 2 alone
+        // rather than w + row 2. Getting this wrong culls everything in front
+        // of the camera and nothing behind it.
+        let near_only = index == 4;
+        for component in 0..4 {
+            let w = if near_only { 0.0 } else { m(3, component) };
+            planes[index][component] = w + sign * m(row, component);
+        }
+        let normal = [planes[index][0], planes[index][1], planes[index][2]];
+        let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+        if length > 1e-6 {
+            for component in 0..4 {
+                planes[index][component] /= length;
+            }
+        }
+    }
+    planes
+}
+
+fn sphere_outside(planes: &[[f32; 4]; 6], centre: [f32; 3], radius: f32) -> bool {
+    planes.iter().any(|p| {
+        p[0] * centre[0] + p[1] * centre[1] + p[2] * centre[2] + p[3] < -radius
+    })
+}
+
+/// A sphere around the mesh in its own space, kept with the uploaded geometry
+/// so it is computed once rather than every frame.
+fn local_bounds(positions: &[[f32; 3]]) -> ([f32; 3], f32) {
+    if positions.is_empty() {
+        return ([0.0; 3], 0.0);
+    }
+    let mut lo = [f32::MAX; 3];
+    let mut hi = [f32::MIN; 3];
+    for p in positions {
+        for axis in 0..3 {
+            lo[axis] = lo[axis].min(p[axis]);
+            hi[axis] = hi[axis].max(p[axis]);
+        }
+    }
+    let centre = [
+        (lo[0] + hi[0]) * 0.5,
+        (lo[1] + hi[1]) * 0.5,
+        (lo[2] + hi[2]) * 0.5,
+    ];
+    // The corner distance, not the longest half-extent: a sphere that only
+    // reaches the face centres leaves the corners of a box outside it.
+    let half = [
+        (hi[0] - lo[0]) * 0.5,
+        (hi[1] - lo[1]) * 0.5,
+        (hi[2] - lo[2]) * 0.5,
+    ];
+    (centre, (half[0] * half[0] + half[1] * half[1] + half[2] * half[2]).sqrt())
+}
+
 struct RealGameMeshDraw<'a> {
     /// Skipped by the scope pass: the gun is not part of the world the scope
     /// is looking at, and drawn there it shows up inside its own eyepiece.
@@ -1551,6 +1638,11 @@ struct RealGameMeshDraw<'a> {
     is_blend: bool,
 
     camera_dist_sq: f32,
+    /// World-space bounding sphere, for the frustum test. A sphere rather than
+    /// a box because a box has to be re-fitted after rotation and a sphere
+    /// only needs its centre moved and its radius scaled.
+    bounds_centre: [f32; 3],
+    bounds_radius: f32,
 
     pub model_matrix: [[f32; 4]; 4],
 }
@@ -2116,6 +2208,7 @@ impl NativeMetalRenderer {
             real_game_scope_active: false,
             screen_capture: crate::screen_capture::ScreenCapture::from_env(),
             joint_ring,
+            last_main_view_projection: std::cell::Cell::new([[0.0; 4]; 4]),
             lightmap: None,
             probes: None,
             probe_origin_spacing: [0.0; 4],
@@ -2254,6 +2347,13 @@ impl NativeMetalRenderer {
             );
         };
 
+        // Once per pass, not per mesh: the scope looks at the world from a
+        // second point of view and gets its own six planes.
+        let planes = frustum_planes(view_projection);
+        if !scope_pass {
+            self.last_main_view_projection.set(view_projection);
+        }
+
         if let Some(meshes) = real_game_meshes {
 
             encoder.set_render_pipeline_state(sponza_pipeline.unwrap());
@@ -2264,7 +2364,7 @@ impl NativeMetalRenderer {
             // skips it on uv2 being zero, but an unbound slot is undefined
             // behaviour rather than a defined white.
             encoder.set_fragment_texture(4, Some(self.lightmap.as_deref().unwrap_or(&self.white_texture)));
-            for m in meshes.iter().filter(|m| !m.is_blend && draws_in_pass(m, scope_pass)) {
+            for m in meshes.iter().filter(|m| !m.is_blend && draws_in_view(m, scope_pass, &planes)) {
                 draw_static_mesh(m);
             }
         }
@@ -2374,7 +2474,7 @@ impl NativeMetalRenderer {
 
             let mut blended: Vec<&RealGameMeshDraw> = meshes
                 .iter()
-                .filter(|m| m.is_blend && draws_in_pass(m, scope_pass))
+                .filter(|m| m.is_blend && draws_in_view(m, scope_pass, &planes))
                 .collect();
             blended.sort_by(|a, b| b.camera_dist_sq.total_cmp(&a.camera_dist_sq));
             if !blended.is_empty() {
@@ -2480,7 +2580,14 @@ impl NativeMetalRenderer {
         if let Some(meshes) = real_game_meshes {
             if let Some(pipeline) = self.shadow_pipeline_sponza.as_ref() {
                 encoder.set_render_pipeline_state(pipeline);
-                for m in meshes {
+                // The light's frustum, not the camera's: a wall behind the
+                // player still casts into the map in front of them.
+                let planes = frustum_planes(light_view_projection);
+                for m in meshes.iter().filter(|m| {
+                    !m.viewmodel
+                        && !m.reticle
+                        && !sphere_outside(&planes, m.bounds_centre, m.bounds_radius)
+                }) {
                     let uniforms = SponzaShadowUniforms { light_view_projection, model_matrix: m.model_matrix };
                     encoder.set_vertex_buffer(0, Some(&m.vertex_buffer), 0);
                     encoder.set_vertex_bytes(1, std::mem::size_of::<SponzaShadowUniforms>() as u64, &uniforms as *const _ as *const _);
@@ -2744,7 +2851,7 @@ impl NativeMetalRenderer {
             .filter(|mesh| mesh.visible)
             .filter_map(|mesh| {
 
-                let (vertex_buffer, index_buffer, index_count, unique_vertices) = match self.gpu_transformed_mesh_cache.get(&mesh.mesh_id) {
+                let (vertex_buffer, index_buffer, index_count, unique_vertices, local_centre, local_radius) = match self.gpu_transformed_mesh_cache.get(&mesh.mesh_id) {
                     Some(cached) => cached.clone(),
                     None => {
                         let (verts, indices) = bake_local_mesh_vertices(mesh);
@@ -2768,7 +2875,8 @@ impl NativeMetalRenderer {
                             (indices.len() * std::mem::size_of::<u32>()) as u64,
                             MTLResourceOptions::StorageModeShared,
                         );
-                        let entry = (buffer, index_buffer, indices.len(), verts.len());
+                        let (centre, radius) = local_bounds(&mesh.positions);
+                        let entry = (buffer, index_buffer, indices.len(), verts.len(), centre, radius);
                         self.gpu_transformed_mesh_cache.insert(mesh.mesh_id, entry.clone());
                         entry
                     }
@@ -2794,6 +2902,12 @@ impl NativeMetalRenderer {
                     normal_texture,
                     is_blend: mesh.is_blend && !self.force_opaque,
                     camera_dist_sq: d[0] * d[0] + d[1] * d[1] + d[2] * d[2],
+                    bounds_centre: mesh.transform.transform_point(bevy::math::Vec3::from_array(local_centre)).to_array(),
+                    // The largest scale on any axis. A non-uniform scale makes
+                    // the true bound an ellipsoid; taking the largest keeps the
+                    // sphere conservative, which is the only direction a cull
+                    // is allowed to be wrong in.
+                    bounds_radius: local_radius * mesh.transform.scale.abs().max_element(),
                     model_matrix,
                 })
             })
@@ -2802,6 +2916,16 @@ impl NativeMetalRenderer {
             if real_game_meshes.is_empty() { None } else { Some(real_game_meshes.as_slice()) };
         timings.bookkeeping_ms = bookkeeping_start.elapsed().as_secs_f32() * 1000.0;
         timings.draws = real_game_meshes.len();
+        // What the main camera's frustum keeps. Reported rather than inferred:
+        // the whole point of the test is a number that moves as the player
+        // turns, and a count that never moves means it is not working.
+        {
+            let planes = frustum_planes(self.last_main_view_projection.get());
+            timings.culled = real_game_meshes
+                .iter()
+                .filter(|m| !draws_in_view(m, false, &planes))
+                .count();
+        }
         timings.cached_textures = self.real_game_textures.len();
         timings.cached_meshes = self.gpu_transformed_mesh_cache.len();
         timings.vertices_drawn = real_game_meshes.iter().map(|m| m.index_count).sum();
@@ -3125,6 +3249,8 @@ impl NativeMetalRenderer {
 #[derive(Default, Copy, Clone)]
 pub struct FrameTimings {
     pub drawable_wait_ms: f32,
+    /// Meshes the main camera's frustum rejected this frame.
+    pub culled: usize,
     /// Texture and mesh cache upkeep plus building the draw list.
     pub bookkeeping_ms: f32,
     /// Shadow maps and the scope render target.
