@@ -415,6 +415,11 @@ struct Uniforms {
     float4x4 pointLightViewProjection;
     packed_float3 cameraPos;
     float _cameraPad;
+    // xyz the probe grid's world origin, w its spacing; then its size in
+    // probes. float4 rather than a float3 and a scalar on purpose -- a lone
+    // float3 would shift every offset after it against Rust's repr(C).
+    float4 probeOriginSpacing;
+    float4 probeDims;
 };
 
 struct VertexOut {
@@ -475,7 +480,10 @@ fragment float4 skinned_fragment(VertexOut in [[stage_in]],
                                   sampler texSampler [[sampler(0)]],
                                   depth2d<float> shadowMap [[texture(1)]],
                                   sampler shadowSampler [[sampler(1)]],
-                                  depth2d<float> pointShadowMap [[texture(2)]]) {
+                                  depth2d<float> pointShadowMap [[texture(2)]],
+                                  texture3d<float> probesPositive [[texture(3)]],
+                                  texture3d<float> probesNegative [[texture(4)]],
+                                  sampler probeSampler [[sampler(2)]]) {
     // Root cause of an earlier version of this struct (kept for the next
     // person who hits this class of bug) found via a 3-step device/
     // Simulator console+shader bisection: (1) raw texColor sample alone →
@@ -522,7 +530,35 @@ fragment float4 skinned_fragment(VertexOut in [[stage_in]],
 
     float4 texColor = baseColorTexture.sample(texSampler, in.uv);
     float4 baseColor = texColor * uniforms.baseColorFactor;
-    float3 lit = baseColor.rgb * (0.35 + 0.65 * diffuseTerm) + specularTerm;
+
+    // The light this thing is standing in, read out of the probe grid.
+    //
+    // Nothing that moves can hold a lightmap, so a zombie inside a building
+    // used to be lit exactly like one in the street. These six numbers are
+    // how open the sky is along each axis at this point in the air; the
+    // normal picks three of them and weights by how much it faces each.
+    float ambient = 0.35;
+    float sunMask = 1.0;
+    if (uniforms.probeOriginSpacing.w > 0.0) {
+        float3 cell = (in.worldPos - uniforms.probeOriginSpacing.xyz)
+                    / uniforms.probeOriginSpacing.w;
+        // Texel centres, not corners: probe i sits at origin + i*spacing, and
+        // sampling at i/dims would read half a cell short of it.
+        float3 uvw = (cell + 0.5) / uniforms.probeDims.xyz;
+        if (all(uvw > 0.0) && all(uvw < 1.0)) {
+            float4 pos = probesPositive.sample(probeSampler, uvw);
+            float4 neg = probesNegative.sample(probeSampler, uvw);
+            float3 n = normalize(in.normal);
+            float3 weight = n * n;
+            float3 openness = float3(
+                n.x >= 0.0 ? pos.r : neg.r,
+                n.y >= 0.0 ? pos.g : neg.g,
+                n.z >= 0.0 ? pos.b : neg.b);
+            ambient = mix(0.06, 0.42, dot(weight, openness));
+            sunMask = pos.a;
+        }
+    }
+    float3 lit = baseColor.rgb * (ambient + 0.65 * diffuseTerm * sunMask) + specularTerm * sunMask;
     return float4(lit, baseColor.a);
 }
 "#;
@@ -956,6 +992,13 @@ struct SkinnedUniforms {
     pub point_light_view_projection: [[f32; 4]; 4],
     pub camera_pos: [f32; 3],
     pub _camera_pad: f32,
+    /// xyz the probe grid's world origin, w its spacing. A float4 rather than
+    /// a float3 and a scalar on purpose -- a lone float3 in the MSL mirror
+    /// consumes a rounded-up sixteen bytes and shifts everything after it
+    /// against Rust's repr(C).
+    pub probe_origin_spacing: [f32; 4],
+    /// xyz the grid's size in probes, w unused.
+    pub probe_dims: [f32; 4],
 }
 
 pub struct NativeMetalRenderer {
@@ -1045,6 +1088,13 @@ pub struct NativeMetalRenderer {
     /// The map's baked ambient occlusion and sun visibility. One texture for
     /// the whole map, supplied by the host -- nothing in the glTF carries it.
     lightmap: Option<metal::Texture>,
+    /// The baked probe grid: six directions of sky openness plus sun
+    /// visibility, split across two RGBA8 volumes because seven channels do
+    /// not fit in four.
+    probes: Option<(metal::Texture, metal::Texture)>,
+    probe_origin_spacing: [f32; 4],
+    probe_dims: [f32; 4],
+    probe_sampler: Option<metal::SamplerState>,
     real_game_scope_fov: f32,
     /// The main view's vertical fov, taken from the snapshot each frame.
     real_game_fov: f32,
@@ -1526,6 +1576,61 @@ impl NativeMetalRenderer {
             (size * 4) as u64,
         );
         self.lightmap = Some(texture);
+    }
+
+    /// Hands over the baked probe grid. Two RGBA8 volumes, `dims` probes on
+    /// each side, the first probe centred on `origin` and `spacing` metres
+    /// between them.
+    pub fn set_light_probes(
+        &mut self,
+        positive: &[u8],
+        negative: &[u8],
+        dims: [u32; 3],
+        origin: [f32; 3],
+        spacing: f32,
+    ) {
+        let volume = |bytes: &[u8]| {
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_texture_type(metal::MTLTextureType::D3);
+            descriptor.set_width(dims[0] as u64);
+            descriptor.set_height(dims[1] as u64);
+            descriptor.set_depth(dims[2] as u64);
+            descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+            descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+            let texture = self.device.new_texture(&descriptor);
+            // replace_region_in_slice, not replace_region: the three-argument
+            // form has no image stride and would upload the first depth slice
+            // over and over.
+            texture.replace_region_in_slice(
+                metal::MTLRegion {
+                    origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: metal::MTLSize {
+                        width: dims[0] as u64,
+                        height: dims[1] as u64,
+                        depth: dims[2] as u64,
+                    },
+                },
+                0,
+                0,
+                bytes.as_ptr() as *const _,
+                (dims[0] * 4) as u64,
+                (dims[0] * dims[1] * 4) as u64,
+            );
+            texture
+        };
+        self.probes = Some((volume(positive), volume(negative)));
+        self.probe_origin_spacing = [origin[0], origin[1], origin[2], spacing];
+        self.probe_dims = [dims[0] as f32, dims[1] as f32, dims[2] as f32, 0.0];
+
+        // Clamped, not repeated: a point just outside the grid should read the
+        // edge probe, not wrap to the far side of the city.
+        let sampler = metal::SamplerDescriptor::new();
+        sampler.set_min_filter(metal::MTLSamplerMinMagFilter::Linear);
+        sampler.set_mag_filter(metal::MTLSamplerMinMagFilter::Linear);
+        sampler.set_address_mode_s(metal::MTLSamplerAddressMode::ClampToEdge);
+        sampler.set_address_mode_t(metal::MTLSamplerAddressMode::ClampToEdge);
+        sampler.set_address_mode_r(metal::MTLSamplerAddressMode::ClampToEdge);
+        self.probe_sampler = Some(self.device.new_sampler(&sampler));
     }
 
     /// How many joint matrices a pose for `name` has to carry, or 0 if no such
@@ -2012,6 +2117,10 @@ impl NativeMetalRenderer {
             screen_capture: crate::screen_capture::ScreenCapture::from_env(),
             joint_ring,
             lightmap: None,
+            probes: None,
+            probe_origin_spacing: [0.0; 4],
+            probe_dims: [1.0; 4],
+            probe_sampler: None,
             real_game_scope_fov: 12.0_f32.to_radians(),
             real_game_fov: std::f32::consts::FRAC_PI_4,
             real_game_scope_lens_world_pos: [0.0, 0.0, 0.0],
@@ -2163,6 +2272,16 @@ impl NativeMetalRenderer {
         let Some(pipeline) = skinned_pipeline else { return };
         encoder.set_render_pipeline_state(pipeline);
         encoder.set_fragment_sampler_state(0, Some(&self.sponza_sampler));
+        // Bound once for the pass. The white texture stands in before a grid
+        // has been handed over -- the shader skips it on spacing being zero,
+        // but an unbound slot is undefined rather than defined white.
+        if let (Some((positive, negative)), Some(sampler)) =
+            (self.probes.as_ref(), self.probe_sampler.as_ref())
+        {
+            encoder.set_fragment_texture(3, Some(positive));
+            encoder.set_fragment_texture(4, Some(negative));
+            encoder.set_fragment_sampler_state(2, Some(sampler));
+        }
 
         for actor in extracted {
             let Some(slot) = self.skinned_models.get(actor.model) else { continue };
@@ -2224,6 +2343,8 @@ impl NativeMetalRenderer {
                     point_light_view_projection,
                     camera_pos,
                     _camera_pad: 0.0,
+                    probe_origin_spacing: self.probe_origin_spacing,
+                    probe_dims: self.probe_dims,
                 };
                 encoder.set_vertex_buffer(0, Some(&mesh.vertex_buffer), 0);
                 encoder.set_vertex_buffer(2, Some(joint_buffer), joint_offset);
