@@ -17,4 +17,6 @@ pub mod skinned_actor;
 #[cfg(target_vendor = "apple")]
 pub mod native_metal_renderer;
 #[cfg(target_vendor = "apple")]
+pub mod screen_capture;
+#[cfg(target_vendor = "apple")]
 pub mod skinned_gltf;

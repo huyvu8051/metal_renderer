@@ -1015,6 +1015,7 @@ pub struct NativeMetalRenderer {
     real_game_scope_eye: [f32; 3],
     real_game_scope_rotation: [f32; 4],
     real_game_scope_active: bool,
+    screen_capture: Option<crate::screen_capture::ScreenCapture>,
     real_game_scope_fov: f32,
     /// The main view's vertical fov, taken from the snapshot each frame.
     real_game_fov: f32,
@@ -1373,6 +1374,23 @@ fn draw_generic_ui_nodes(
 }
 
 /// Render layers, reduced to the only question a pass has to ask.
+/// Blocks on the frame just submitted, which is why it only ever runs once:
+/// the readback is worth a stall, a stall every frame is not. Free-standing so
+/// it borrows only the slot, not the whole renderer the drawable came from.
+fn capture_if_due(
+    slot: &mut Option<crate::screen_capture::ScreenCapture>,
+    command_buffer: &metal::CommandBufferRef,
+    drawable: &metal::TextureRef,
+) {
+    if !slot.as_ref().is_some_and(|c| c.due()) {
+        return;
+    }
+    command_buffer.wait_until_completed();
+    if let Some(capture) = slot.take() {
+        capture.write(drawable);
+    }
+}
+
 fn draws_in_pass(mesh: &RealGameMeshDraw, scope_pass: bool) -> bool {
     if scope_pass { !mesh.viewmodel } else { !mesh.reticle }
 }
@@ -1881,6 +1899,7 @@ impl NativeMetalRenderer {
             real_game_scope_eye: [0.0, 0.0, 0.0],
             real_game_scope_rotation: [0.0, 0.0, 0.0, 1.0],
             real_game_scope_active: false,
+            screen_capture: crate::screen_capture::ScreenCapture::from_env(),
             real_game_scope_fov: 12.0_f32.to_radians(),
             real_game_fov: std::f32::consts::FRAC_PI_4,
             real_game_scope_lens_world_pos: [0.0, 0.0, 0.0],
@@ -2810,6 +2829,9 @@ impl NativeMetalRenderer {
             command_buffer.present_drawable(drawable);
         }
         command_buffer.commit();
+        if skip_blit {
+            capture_if_due(&mut self.screen_capture, &command_buffer, drawable_texture);
+        }
         timings.scene_ms = scene_start.elapsed().as_secs_f32() * 1000.0;
         self.last_command_buffers.push(("scene", command_buffer.to_owned()));
         if skip_blit {
@@ -2835,6 +2857,7 @@ impl NativeMetalRenderer {
         }
         blit_command_buffer.present_drawable(drawable);
         blit_command_buffer.commit();
+        capture_if_due(&mut self.screen_capture, &blit_command_buffer, drawable_texture);
         self.last_command_buffers.push(("blit", blit_command_buffer.to_owned()));
         timings.blit_ms = blit_start.elapsed().as_secs_f32() * 1000.0;
         timings

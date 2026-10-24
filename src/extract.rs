@@ -79,6 +79,13 @@ pub fn decode_texture(
             }
             std::sync::Arc::from(swapped.as_slice())
         }
+        // Every decal in the game is a 16-bit PNG, and with no path here they
+        // all drew untextured -- a white square where a blood splatter or a
+        // bullet hole should be, since the shape lives entirely in the alpha.
+        TextureFormat::Rgba16Unorm | TextureFormat::Rgba16Float => {
+            let narrowed: Vec<u8> = data.chunks_exact(2).map(|pair| pair[1]).collect();
+            std::sync::Arc::from(narrowed.as_slice())
+        }
         // Straight through. Returning None here is what left every ASTC
         // texture unextracted and the map drawing in its fallback colour.
         TextureFormat::Astc { block, channel } => {
