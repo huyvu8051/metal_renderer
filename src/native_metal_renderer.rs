@@ -95,7 +95,20 @@ const FALLBACK_LIGHT: LightUniform = LightUniform {
     sun_color: [1.0, 1.0, 1.0, 0.0],
 };
 
+/// Where `assets/` lives.
+///
+/// `BEVY_ASSET_ROOT` first, because the rest of the game already honours it
+/// and this loader did not: outside a bundle NSBundle hands back the
+/// executable's own directory, so a release build found assets only through a
+/// symlink someone had left in target/release and a debug build found nothing
+/// at all. Zombies still spawned -- they were being shot at -- but every
+/// skinned model failed to load and they had no mesh.
 pub fn bundle_resource_path() -> Option<String> {
+    if let Ok(root) = std::env::var("BEVY_ASSET_ROOT") {
+        if !root.is_empty() {
+            return Some(root);
+        }
+    }
     unsafe {
         let bundle_class = class!(NSBundle);
         let bundle: *mut Object = msg_send![bundle_class, mainBundle];
