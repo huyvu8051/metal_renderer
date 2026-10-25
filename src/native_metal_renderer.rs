@@ -869,7 +869,7 @@ struct BlitVertex {
 
 const GLYPH_W: usize = 5;
 const GLYPH_H: usize = 7;
-const GLYPH_COUNT: usize = 43;
+const GLYPH_COUNT: usize = 45;
 
 const GLYPH_BITMAPS: [[u8; GLYPH_H]; GLYPH_COUNT] = [
     [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
@@ -915,6 +915,11 @@ const GLYPH_BITMAPS: [[u8; GLYPH_H]; GLYPH_COUNT] = [
     [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
     [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
     [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
+    // Hyphen and comma. Added for the credits screen: a licence named
+    // CCBY4.0 is not the licence the asset was given under, and a credit
+    // that cannot spell the licence is a weak credit.
+    [0b00000, 0b00000, 0b00000, 0b01110, 0b00000, 0b00000, 0b00000],
+    [0b00000, 0b00000, 0b00000, 0b00000, 0b00110, 0b00100, 0b01000],
 ];
 
 fn glyph_index(c: char) -> Option<usize> {
@@ -953,6 +958,8 @@ fn glyph_index(c: char) -> Option<usize> {
         'X' => Some(40),
         'Y' => Some(41),
         'Z' => Some(42),
+        '-' => Some(43),
+        ',' => Some(44),
         _ => None,
     }
 }
@@ -2240,7 +2247,10 @@ impl NativeMetalRenderer {
             font_atlas_texture,
             ui_generic_nodes: Vec::new(),
             force_offscreen: false,
-            force_opaque: false,
+            // FORCE_OPAQUE=1 draws blended meshes as opaque: same geometry, same
+            // draw count, no blending, depth writes on. The difference against a
+            // normal run is what transparency itself costs.
+            force_opaque: std::env::var("FORCE_OPAQUE").is_ok(),
             last_command_buffers: Vec::new(),
             shadow_quality_requested: 0,
             shadow_static: true,
