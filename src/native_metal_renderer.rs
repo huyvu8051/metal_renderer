@@ -1114,6 +1114,13 @@ pub struct NativeMetalRenderer {
     mesh_refs: std::collections::HashMap<AssetId<Mesh>, u32>,
     texture_refs: std::collections::HashMap<AssetId<Image>, u32>,
 
+    /// Which slots hold a transparent draw. The blend pass used to find them
+    /// by filtering the whole list, every frame and every pass, to come back
+    /// with a handful -- the last walk that was searching for something it
+    /// could have been told. Ordered, so the pass still reaches them in slot
+    /// order before sorting them back to front.
+    blend_slots: std::collections::BTreeSet<usize>,
+
     real_game_camera_rotation: [f32; 4],
 
     real_game_ads_blend: f32,
@@ -2314,6 +2321,7 @@ impl NativeMetalRenderer {
             real_game_draws: Vec::new(),
             mesh_refs: std::collections::HashMap::new(),
             texture_refs: std::collections::HashMap::new(),
+            blend_slots: std::collections::BTreeSet::new(),
             real_game_camera_rotation: [0.0, 0.0, 0.0, 1.0],
             real_game_ads_blend: 0.0,
             real_game_scope_zoom: 8.0,
@@ -2629,10 +2637,11 @@ impl NativeMetalRenderer {
                 ];
                 d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
             };
-            let mut blended: Vec<&RealGameMeshDraw> = meshes
+            let mut blended: Vec<&RealGameMeshDraw> = self
+                .blend_slots
                 .iter()
-                .flatten()
-                .filter(|m| m.is_blend && draws_in_view(m, scope_pass, &planes))
+                .filter_map(|slot| meshes.get(*slot).and_then(|m| m.as_ref()))
+                .filter(|m| draws_in_view(m, scope_pass, &planes))
                 .collect();
             blended.sort_by(|a, b| dist_sq(b).total_cmp(&dist_sq(a)));
             if !blended.is_empty() {
@@ -2998,6 +3007,7 @@ impl NativeMetalRenderer {
         }
         for (slot, mesh) in &mesh_updates {
             if !mesh.visible {
+                self.blend_slots.remove(slot);
                 if let Some(gone) = self.real_game_draws[*slot].take() {
                     release_draw_assets(
                         &mut self.mesh_refs, &mut self.texture_refs,
@@ -3019,6 +3029,7 @@ impl NativeMetalRenderer {
                             mesh.uvs.len(),
                             mesh.indices.len()
                         );
+                        self.blend_slots.remove(slot);
                         if let Some(gone) = self.real_game_draws[*slot].take() {
                             release_draw_assets(
                                 &mut self.mesh_refs, &mut self.texture_refs,
@@ -3092,6 +3103,11 @@ impl NativeMetalRenderer {
             // Retain before release: a slot usually keeps the same assets
             // across an update, and releasing first would take their count to
             // zero and throw away buffers the new draw is about to ask for.
+            if draw.is_blend {
+                self.blend_slots.insert(*slot);
+            } else {
+                self.blend_slots.remove(slot);
+            }
             retain_draw_assets(&mut self.mesh_refs, &mut self.texture_refs, &draw);
             if let Some(gone) = self.real_game_draws[*slot].replace(draw) {
                 release_draw_assets(
@@ -3123,6 +3139,10 @@ impl NativeMetalRenderer {
                     timings.blend_draws += 1;
                 }
             }
+            // The index the blend pass now trusts, against the count this
+            // walk arrives at the slow way. A slot that enters or leaves
+            // blend without telling the index draws nothing, or draws twice.
+            debug_assert_eq!(timings.blend_draws, self.blend_slots.len());
         }
         let passes_start = std::time::Instant::now();
 
