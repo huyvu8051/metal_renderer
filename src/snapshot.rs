@@ -107,6 +107,11 @@ pub struct RenderSnapshot {
     pub scope_camera: Option<ScopeCameraSnapshot>,
     pub skinned_actors: Vec<SkinnedRenderState>,
     pub static_meshes: Vec<ExtractedMesh>,
+    /// False when the mesh set is the same one as last frame, which it is for
+    /// almost every frame of a map that does not change. The renderer rebuilds
+    /// two HashSets over every mesh and sweeps two caches when this is set, and
+    /// that upkeep is pointless against an unchanged list.
+    pub static_meshes_changed: bool,
     pub light: Option<LightSnapshot>,
     pub sun: Option<SunSnapshot>,
     pub map_msaa_on: bool,

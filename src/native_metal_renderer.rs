@@ -2739,6 +2739,7 @@ impl NativeMetalRenderer {
         let now = self.start_time.elapsed().as_secs_f32();
 
         let real_game_static_meshes: Vec<super::snapshot::ExtractedMesh>;
+        let mut snapshot_meshes_changed = false;
 
         let mut real_game_extracted: Vec<super::skinned_actor::SkinnedActorDraw> = Vec::new();
         {
@@ -2784,6 +2785,7 @@ impl NativeMetalRenderer {
                 snapshot.point_light_quality.min(5) as f32 / 5.0,
             );
             real_game_static_meshes = snapshot.static_meshes;
+            snapshot_meshes_changed = snapshot.static_meshes_changed;
 
             real_game_extracted.extend(snapshot.skinned_actors.into_iter().map(|actor| {
                 super::skinned_actor::SkinnedActorDraw {
@@ -2855,45 +2857,54 @@ impl NativeMetalRenderer {
         let drawable_texture = drawable.texture();
         let texture = offscreen.unwrap_or_else(|| drawable_texture.to_owned());
 
-        let used_texture_ids: std::collections::HashSet<AssetId<Image>> = real_game_static_meshes
-            .iter()
-            .flat_map(|mesh| [mesh.texture.as_ref(), mesh.normal_texture.as_ref()].into_iter().flatten())
-            .chain(self.ui_generic_nodes.iter().filter_map(|node| node.image.as_ref()))
-            .map(|t| t.id)
-            .collect();
-        self.real_game_textures.retain(|id, _| used_texture_ids.contains(id));
+        // Only when the mesh set actually changed. Two HashSets built over every
+        // mesh and two cache sweeps, every frame, to reconcile a list that for a
+        // static map is identical to last frame's -- desert_swift_metal builds
+        // its texture list once at load and never looks again.
+        // UI textures first and unconditionally: a HUD image appears and goes
+        // without the mesh set moving at all, and gating this on meshes would
+        // leave it unuploaded until something else happened to change.
         for image in self.ui_generic_nodes.iter().filter_map(|node| node.image.as_ref()) {
             if !self.real_game_textures.contains_key(&image.id) {
-                let uploaded =
-                    match image.astc {
-                        Some(block) => super::metal_texture::upload_astc(
-                            &self.device, image.width, image.height, &image.rgba, block,
-                        ),
-                        None => super::metal_texture::upload_texture(
-                            &self.device, image.width, image.height, &image.rgba,
-                        ),
-                    };
+                let uploaded = match image.astc {
+                    Some(block) => super::metal_texture::upload_astc(
+                        &self.device, image.width, image.height, &image.rgba, block,
+                    ),
+                    None => super::metal_texture::upload_texture(
+                        &self.device, image.width, image.height, &image.rgba,
+                    ),
+                };
                 self.real_game_textures.insert(image.id, uploaded);
             }
         }
-        let used_mesh_ids: std::collections::HashSet<AssetId<Mesh>> =
-            real_game_static_meshes.iter().map(|mesh| mesh.mesh_id).collect();
-        self.gpu_transformed_mesh_cache.retain(|id, _| used_mesh_ids.contains(id));
 
-        for mesh in &real_game_static_meshes {
+        if snapshot_meshes_changed {
+            let used_texture_ids: std::collections::HashSet<AssetId<Image>> = real_game_static_meshes
+                .iter()
+                .flat_map(|mesh| [mesh.texture.as_ref(), mesh.normal_texture.as_ref()].into_iter().flatten())
+                .chain(self.ui_generic_nodes.iter().filter_map(|node| node.image.as_ref()))
+                .map(|t| t.id)
+                .collect();
+            self.real_game_textures.retain(|id, _| used_texture_ids.contains(id));
 
-            for t in [mesh.texture.as_ref(), mesh.normal_texture.as_ref()].into_iter().flatten() {
-                if !self.real_game_textures.contains_key(&t.id) {
-                    let uploaded = match t.astc {
-                        Some(block) => super::metal_texture::upload_astc(
-                            &self.device, t.width, t.height, &t.rgba, block,
-                        ),
-                        None => super::metal_texture::upload_texture(
-                            &self.device, t.width, t.height, &t.rgba,
-                        ),
-                    };
-                    self.real_game_textures.insert(t.id, uploaded);
-                    timings.texture_uploads += 1;
+            let used_mesh_ids: std::collections::HashSet<AssetId<Mesh>> =
+                real_game_static_meshes.iter().map(|mesh| mesh.mesh_id).collect();
+            self.gpu_transformed_mesh_cache.retain(|id, _| used_mesh_ids.contains(id));
+
+            for mesh in &real_game_static_meshes {
+                for t in [mesh.texture.as_ref(), mesh.normal_texture.as_ref()].into_iter().flatten() {
+                    if !self.real_game_textures.contains_key(&t.id) {
+                        let uploaded = match t.astc {
+                            Some(block) => super::metal_texture::upload_astc(
+                                &self.device, t.width, t.height, &t.rgba, block,
+                            ),
+                            None => super::metal_texture::upload_texture(
+                                &self.device, t.width, t.height, &t.rgba,
+                            ),
+                        };
+                        self.real_game_textures.insert(t.id, uploaded);
+                        timings.texture_uploads += 1;
+                    }
                 }
             }
         }
