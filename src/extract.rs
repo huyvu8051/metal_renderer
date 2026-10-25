@@ -57,6 +57,41 @@ pub struct StaticMeshCache {
     /// Slots written since the host last drained this. The renderer holds the
     /// rest from previous frames, so only these need to cross.
     pub dirty: Vec<usize>,
+    /// How many live slots name each decoded texture. An entity leaving frees
+    /// nothing while another still names the same asset, which is why the
+    /// trigger for dropping one cannot be "a slot emptied".
+    pub texture_refs: std::collections::HashMap<AssetId<Image>, u32>,
+    /// Ids whose count reached zero, waiting to be dropped from the decoded
+    /// cache. Drained by the host each extraction.
+    pub released_textures: Vec<AssetId<Image>>,
+}
+
+impl StaticMeshCache {
+    /// Counts a mesh's textures as used by one more slot. Always called
+    /// before the slot it replaces is released, so an id the outgoing and
+    /// incoming meshes share never passes through zero.
+    pub fn retain_textures(&mut self, mesh: &ExtractedMesh) {
+        for id in texture_ids(mesh).into_iter().flatten() {
+            *self.texture_refs.entry(id).or_insert(0) += 1;
+        }
+    }
+
+    /// Counts a slot's textures as used by one fewer slot, listing whatever
+    /// reaches nobody in `released_textures`.
+    pub fn release_slot_textures(&mut self, slot: usize) {
+        for id in texture_ids(&self.entries[slot]).into_iter().flatten() {
+            let Some(count) = self.texture_refs.get_mut(&id) else { continue };
+            *count -= 1;
+            if *count == 0 {
+                self.texture_refs.remove(&id);
+                self.released_textures.push(id);
+            }
+        }
+    }
+}
+
+fn texture_ids(mesh: &ExtractedMesh) -> [Option<AssetId<Image>>; 2] {
+    [mesh.texture.as_ref().map(|t| t.id), mesh.normal_texture.as_ref().map(|t| t.id)]
 }
 
 pub fn decode_texture(
@@ -163,12 +198,19 @@ pub fn store_extracted_mesh(
     } else {
         cache.awaiting_textures.remove(&entity);
     }
+    cache.retain_textures(&extracted);
     match slot {
         Some(slot) => {
+            // The outgoing mesh usually names the same textures as the one
+            // replacing it, and releasing before retaining would take their
+            // count to zero and throw away a decode that is still wanted.
+            cache.release_slot_textures(slot);
             cache.entries[slot] = extracted;
             cache.dirty.push(slot);
         }
         None => match cache.free_slots.pop() {
+            // A freed slot was released when its entity left, so there is
+            // nothing of the previous occupant's left to count down.
             Some(slot) => {
                 cache.slot_of.insert(entity, slot);
                 cache.entries[slot] = extracted;

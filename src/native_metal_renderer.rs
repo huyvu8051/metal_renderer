@@ -1105,6 +1105,15 @@ pub struct NativeMetalRenderer {
     /// slot stays so every other index keeps its meaning.
     real_game_draws: Vec<Option<RealGameMeshDraw>>,
 
+    /// How many live slots name each asset. A slot emptying frees nothing
+    /// while another still names the same id -- sixty-four bullet holes share
+    /// one mesh and one texture between them, so "an entity left" and "an
+    /// asset stopped being used" are different questions. Counting answers
+    /// the second one for the price of the slots that actually changed,
+    /// instead of sweeping the whole list on the first.
+    mesh_refs: std::collections::HashMap<AssetId<Mesh>, u32>,
+    texture_refs: std::collections::HashMap<AssetId<Image>, u32>,
+
     real_game_camera_rotation: [f32; 4],
 
     real_game_ads_blend: f32,
@@ -1675,8 +1684,8 @@ struct RealGameMeshDraw {
     pub emissive: [f32; 4],
     texture: Option<metal::Texture>,
     normal_texture: Option<metal::Texture>,
-    /// Which assets this slot holds, so the caches can be swept for ids that
-    /// no live slot still names. Only read when a slot is freed.
+    /// Which assets this slot holds, so leaving the list can decrement the
+    /// right counts.
     mesh_id: AssetId<Mesh>,
     texture_id: Option<AssetId<Image>>,
     normal_texture_id: Option<AssetId<Image>>,
@@ -1692,6 +1701,64 @@ struct RealGameMeshDraw {
     pub model_matrix: [[f32; 4]; 4],
 }
 
+
+/// Counts a draw's assets as used by one more slot.
+///
+/// Always called before the slot it replaces is released, so an id that both
+/// the outgoing and the incoming draw name never passes through zero and never
+/// loses its GPU buffers.
+///
+/// Free functions rather than methods: the drawable holds a borrow of the
+/// renderer for the length of the frame, so nothing in here may take `&mut
+/// self`.
+fn retain_draw_assets(
+    mesh_refs: &mut std::collections::HashMap<AssetId<Mesh>, u32>,
+    texture_refs: &mut std::collections::HashMap<AssetId<Image>, u32>,
+    draw: &RealGameMeshDraw,
+) {
+    *mesh_refs.entry(draw.mesh_id).or_insert(0) += 1;
+    for id in [draw.texture_id, draw.normal_texture_id].into_iter().flatten() {
+        *texture_refs.entry(id).or_insert(0) += 1;
+    }
+}
+
+/// Counts a draw's assets as used by one fewer slot, dropping whatever reaches
+/// nobody.
+fn release_draw_assets(
+    mesh_refs: &mut std::collections::HashMap<AssetId<Mesh>, u32>,
+    texture_refs: &mut std::collections::HashMap<AssetId<Image>, u32>,
+    geometry: &mut std::collections::HashMap<
+        AssetId<Mesh>,
+        (metal::Buffer, metal::Buffer, usize, usize, [f32; 3], f32),
+    >,
+    textures: &mut std::collections::HashMap<AssetId<Image>, metal::Texture>,
+    ui_nodes: &[super::snapshot::GenericUiNode],
+    draw: RealGameMeshDraw,
+) {
+    if let Some(count) = mesh_refs.get_mut(&draw.mesh_id) {
+        *count -= 1;
+        if *count == 0 {
+            mesh_refs.remove(&draw.mesh_id);
+            geometry.remove(&draw.mesh_id);
+        }
+    }
+    for id in [draw.texture_id, draw.normal_texture_id].into_iter().flatten() {
+        let Some(count) = texture_refs.get_mut(&id) else { continue };
+        *count -= 1;
+        if *count > 0 {
+            continue;
+        }
+        texture_refs.remove(&id);
+        // A HUD image lives in the same map without any mesh naming it, so no
+        // count ever stands behind it. Checked only here, where a count has
+        // just reached zero, and against a list of tens.
+        let on_screen =
+            ui_nodes.iter().any(|node| node.image.as_ref().is_some_and(|image| image.id == id));
+        if !on_screen {
+            textures.remove(&id);
+        }
+    }
+}
 
 impl NativeMetalRenderer {
     /// Hands over the map's baked lightmap. RGBA8 bytes, R ambient occlusion
@@ -2245,6 +2312,8 @@ impl NativeMetalRenderer {
             real_game_textures: std::collections::HashMap::new(),
             gpu_transformed_mesh_cache: std::collections::HashMap::new(),
             real_game_draws: Vec::new(),
+            mesh_refs: std::collections::HashMap::new(),
+            texture_refs: std::collections::HashMap::new(),
             real_game_camera_rotation: [0.0, 0.0, 0.0, 1.0],
             real_game_ads_blend: 0.0,
             real_game_scope_zoom: 8.0,
@@ -2783,7 +2852,6 @@ impl NativeMetalRenderer {
 
         let mesh_updates: Vec<(usize, super::snapshot::ExtractedMesh)>;
         let mesh_slots: usize;
-        let meshes_freed: bool;
 
         let mut real_game_extracted: Vec<super::skinned_actor::SkinnedActorDraw> = Vec::new();
         {
@@ -2830,7 +2898,6 @@ impl NativeMetalRenderer {
             );
             mesh_updates = snapshot.static_mesh_updates;
             mesh_slots = snapshot.static_mesh_slots;
-            meshes_freed = snapshot.static_mesh_freed;
 
             real_game_extracted.extend(snapshot.skinned_actors.into_iter().map(|actor| {
                 super::skinned_actor::SkinnedActorDraw {
@@ -2931,24 +2998,15 @@ impl NativeMetalRenderer {
         }
         for (slot, mesh) in &mesh_updates {
             if !mesh.visible {
-                self.real_game_draws[*slot] = None;
+                if let Some(gone) = self.real_game_draws[*slot].take() {
+                    release_draw_assets(
+                        &mut self.mesh_refs, &mut self.texture_refs,
+                        &mut self.gpu_transformed_mesh_cache, &mut self.real_game_textures,
+                        &self.ui_generic_nodes, gone,
+                    );
+                }
                 continue;
             }
-            for t in [mesh.texture.as_ref(), mesh.normal_texture.as_ref()].into_iter().flatten() {
-                if !self.real_game_textures.contains_key(&t.id) {
-                    let uploaded = match t.astc {
-                        Some(block) => super::metal_texture::upload_astc(
-                            &self.device, t.width, t.height, &t.rgba, block,
-                        ),
-                        None => super::metal_texture::upload_texture(
-                            &self.device, t.width, t.height, &t.rgba,
-                        ),
-                    };
-                    self.real_game_textures.insert(t.id, uploaded);
-                    timings.texture_uploads += 1;
-                }
-            }
-
             let geometry = match self.gpu_transformed_mesh_cache.get(&mesh.mesh_id) {
                 Some(cached) => cached.clone(),
                 None => {
@@ -2961,7 +3019,13 @@ impl NativeMetalRenderer {
                             mesh.uvs.len(),
                             mesh.indices.len()
                         );
-                        self.real_game_draws[*slot] = None;
+                        if let Some(gone) = self.real_game_draws[*slot].take() {
+                            release_draw_assets(
+                                &mut self.mesh_refs, &mut self.texture_refs,
+                                &mut self.gpu_transformed_mesh_cache, &mut self.real_game_textures,
+                                &self.ui_generic_nodes, gone,
+                            );
+                        }
                         continue;
                     }
                     let buffer = self.device.new_buffer_with_data(
@@ -2982,7 +3046,24 @@ impl NativeMetalRenderer {
             };
             let (vertex_buffer, index_buffer, index_count, unique_vertices, local_centre, local_radius) =
                 geometry;
-            self.real_game_draws[*slot] = Some(RealGameMeshDraw {
+            // After the bake, not before: a mesh that fails to bake builds no
+            // draw, so nothing would ever stand behind textures uploaded for it
+            // and nothing would ever count them back down.
+            for t in [mesh.texture.as_ref(), mesh.normal_texture.as_ref()].into_iter().flatten() {
+                if !self.real_game_textures.contains_key(&t.id) {
+                    let uploaded = match t.astc {
+                        Some(block) => super::metal_texture::upload_astc(
+                            &self.device, t.width, t.height, &t.rgba, block,
+                        ),
+                        None => super::metal_texture::upload_texture(
+                            &self.device, t.width, t.height, &t.rgba,
+                        ),
+                    };
+                    self.real_game_textures.insert(t.id, uploaded);
+                    timings.texture_uploads += 1;
+                }
+            }
+            let draw = RealGameMeshDraw {
                 viewmodel: mesh.viewmodel,
                 reticle: mesh.reticle,
                 vertex_buffer,
@@ -3007,24 +3088,18 @@ impl NativeMetalRenderer {
                 // is allowed to be wrong in.
                 bounds_radius: local_radius * mesh.transform.scale.abs().max_element(),
                 model_matrix: mesh.transform.to_matrix().to_cols_array_2d(),
-            });
-        }
-
-        // A slot emptying is the only way an asset can stop being used, so
-        // this is the only frame on which a sweep can find anything.
-        if meshes_freed {
-            let live_textures: std::collections::HashSet<AssetId<Image>> = self
-                .real_game_draws
-                .iter()
-                .flatten()
-                .flat_map(|d| [d.texture_id, d.normal_texture_id].into_iter().flatten())
-                .chain(self.ui_generic_nodes.iter().filter_map(|node| node.image.as_ref()).map(|t| t.id))
-                .collect();
-            self.real_game_textures.retain(|id, _| live_textures.contains(id));
-
-            let live_meshes: std::collections::HashSet<AssetId<Mesh>> =
-                self.real_game_draws.iter().flatten().map(|d| d.mesh_id).collect();
-            self.gpu_transformed_mesh_cache.retain(|id, _| live_meshes.contains(id));
+            };
+            // Retain before release: a slot usually keeps the same assets
+            // across an update, and releasing first would take their count to
+            // zero and throw away buffers the new draw is about to ask for.
+            retain_draw_assets(&mut self.mesh_refs, &mut self.texture_refs, &draw);
+            if let Some(gone) = self.real_game_draws[*slot].replace(draw) {
+                release_draw_assets(
+                    &mut self.mesh_refs, &mut self.texture_refs,
+                    &mut self.gpu_transformed_mesh_cache, &mut self.real_game_textures,
+                    &self.ui_generic_nodes, gone,
+                );
+            }
         }
 
         let real_game_meshes_opt =

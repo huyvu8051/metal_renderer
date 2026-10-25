@@ -115,10 +115,6 @@ pub struct RenderSnapshot {
     /// How many slots the host's cache holds, so the renderer can size its
     /// list to match. Slots are reused, so this only grows to a high-water mark.
     pub static_mesh_slots: usize,
-    /// True when a slot was freed. An asset stops being used only by an entity
-    /// leaving, so this is the one reason to sweep the texture and geometry
-    /// caches.
-    pub static_mesh_freed: bool,
     pub light: Option<LightSnapshot>,
     pub sun: Option<SunSnapshot>,
     pub map_msaa_on: bool,
