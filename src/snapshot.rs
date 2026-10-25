@@ -106,12 +106,19 @@ pub struct RenderSnapshot {
     pub camera: Option<CameraSnapshot>,
     pub scope_camera: Option<ScopeCameraSnapshot>,
     pub skinned_actors: Vec<SkinnedRenderState>,
-    pub static_meshes: Vec<ExtractedMesh>,
-    /// False when the mesh set is the same one as last frame, which it is for
-    /// almost every frame of a map that does not change. The renderer rebuilds
-    /// two HashSets over every mesh and sweeps two caches when this is set, and
-    /// that upkeep is pointless against an unchanged list.
-    pub static_meshes_changed: bool,
+    /// Only the slots whose mesh actually changed, each paired with its index
+    /// into the renderer's persistent draw list. A map that does not move
+    /// sends nothing, and the renderer keeps last frame's entries --
+    /// desert_swift_metal gets the same thing for free by building its draw
+    /// list once at load and never looking at it again.
+    pub static_mesh_updates: Vec<(usize, ExtractedMesh)>,
+    /// How many slots the host's cache holds, so the renderer can size its
+    /// list to match. Slots are reused, so this only grows to a high-water mark.
+    pub static_mesh_slots: usize,
+    /// True when a slot was freed. An asset stops being used only by an entity
+    /// leaving, so this is the one reason to sweep the texture and geometry
+    /// caches.
+    pub static_mesh_freed: bool,
     pub light: Option<LightSnapshot>,
     pub sun: Option<SunSnapshot>,
     pub map_msaa_on: bool,

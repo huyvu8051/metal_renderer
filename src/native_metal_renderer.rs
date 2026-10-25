@@ -1099,6 +1099,12 @@ pub struct NativeMetalRenderer {
         (metal::Buffer, metal::Buffer, usize, usize, [f32; 3], f32),
     >,
 
+    /// The draw list, indexed by the host's slot and kept between frames. Only
+    /// the slots the host reports as changed are rebuilt, so a still scene
+    /// prepares nothing. `None` is a slot whose entity is gone or hidden; the
+    /// slot stays so every other index keeps its meaning.
+    real_game_draws: Vec<Option<RealGameMeshDraw>>,
+
     real_game_camera_rotation: [f32; 4],
 
     real_game_ads_blend: f32,
@@ -1148,6 +1154,10 @@ pub struct NativeMetalRenderer {
     /// Draw every mesh as opaque, ignoring its alpha mode. desert_rust_metal
     /// does this implicitly by never reading alphaMode at all.
     pub force_opaque: bool,
+    /// Whether to count draws, culls and vertices. The counting is five walks
+    /// over the whole draw list and nothing reads the result unless the host
+    /// is printing its stats line.
+    stats_enabled: bool,
     /// Kept one frame so its GPU timestamps can be read after it completes.
     /// Last frame's submissions, labelled, kept so their GPU timestamps can be
     /// read once they have completed.
@@ -1642,7 +1652,16 @@ fn local_bounds(positions: &[[f32; 3]]) -> ([f32; 3], f32) {
     (centre, (half[0] * half[0] + half[1] * half[1] + half[2] * half[2]).sqrt())
 }
 
-struct RealGameMeshDraw<'a> {
+/// One slot of the persistent draw list. Everything above `model_matrix` is
+/// settled when the entity appears and never touched again; the list survives
+/// between frames so a scene that does not change costs nothing to prepare.
+///
+/// The textures are owned handles rather than borrows into
+/// `real_game_textures` -- a borrow would make this self-referential and it
+/// could not live on the renderer at all. A `metal::Texture` is a refcount,
+/// so the clone is a retain, not a copy of any pixels.
+#[derive(Clone)]
+struct RealGameMeshDraw {
     /// Skipped by the scope pass: the gun is not part of the world the scope
     /// is looking at, and drawn there it shows up inside its own eyepiece.
     viewmodel: bool,
@@ -1654,12 +1673,16 @@ struct RealGameMeshDraw<'a> {
     unique_vertices: usize,
     pub base_color_factor: [f32; 4],
     pub emissive: [f32; 4],
-    texture: Option<&'a metal::Texture>,
-    normal_texture: Option<&'a metal::Texture>,
+    texture: Option<metal::Texture>,
+    normal_texture: Option<metal::Texture>,
+    /// Which assets this slot holds, so the caches can be swept for ids that
+    /// no live slot still names. Only read when a slot is freed.
+    mesh_id: AssetId<Mesh>,
+    texture_id: Option<AssetId<Image>>,
+    normal_texture_id: Option<AssetId<Image>>,
 
     is_blend: bool,
 
-    camera_dist_sq: f32,
     /// World-space bounding sphere, for the frustum test. A sphere rather than
     /// a box because a box has to be re-fitted after rotation and a sphere
     /// only needs its centre moved and its radius scaled.
@@ -2221,6 +2244,7 @@ impl NativeMetalRenderer {
 
             real_game_textures: std::collections::HashMap::new(),
             gpu_transformed_mesh_cache: std::collections::HashMap::new(),
+            real_game_draws: Vec::new(),
             real_game_camera_rotation: [0.0, 0.0, 0.0, 1.0],
             real_game_ads_blend: 0.0,
             real_game_scope_zoom: 8.0,
@@ -2251,6 +2275,7 @@ impl NativeMetalRenderer {
             // draw count, no blending, depth writes on. The difference against a
             // normal run is what transparency itself costs.
             force_opaque: std::env::var("FORCE_OPAQUE").is_ok(),
+            stats_enabled: std::env::var("NATIVE_STATS").is_ok(),
             last_command_buffers: Vec::new(),
             shadow_quality_requested: 0,
             shadow_static: true,
@@ -2322,7 +2347,7 @@ impl NativeMetalRenderer {
 
         extracted: &[super::skinned_actor::SkinnedActorDraw],
         _now: f32,
-        real_game_meshes: Option<&[RealGameMeshDraw]>,
+        real_game_meshes: Option<&[Option<RealGameMeshDraw>]>,
 
         msaa_enabled: bool,
 
@@ -2380,9 +2405,9 @@ impl NativeMetalRenderer {
                 std::mem::size_of::<SponzaUniforms>() as u64,
                 &sponza_uniforms as *const _ as *const _,
             );
-            let texture = m.texture.unwrap_or(&self.white_texture);
+            let texture = m.texture.as_ref().unwrap_or(&self.white_texture);
             encoder.set_fragment_texture(0, Some(texture));
-            let normal_texture = m.normal_texture.unwrap_or(&self.flat_normal_texture);
+            let normal_texture = m.normal_texture.as_ref().unwrap_or(&self.flat_normal_texture);
             encoder.set_fragment_texture(3, Some(normal_texture));
             encoder.draw_indexed_primitives(
                 MTLPrimitiveType::Triangle,
@@ -2410,7 +2435,11 @@ impl NativeMetalRenderer {
             // skips it on uv2 being zero, but an unbound slot is undefined
             // behaviour rather than a defined white.
             encoder.set_fragment_texture(4, Some(self.lightmap.as_deref().unwrap_or(&self.white_texture)));
-            for m in meshes.iter().filter(|m| !m.is_blend && draws_in_view(m, scope_pass, &planes)) {
+            for m in meshes
+                .iter()
+                .flatten()
+                .filter(|m| !m.is_blend && draws_in_view(m, scope_pass, &planes))
+            {
                 draw_static_mesh(m);
             }
         }
@@ -2518,11 +2547,25 @@ impl NativeMetalRenderer {
 
         if let Some(meshes) = real_game_meshes {
 
+            // Measured here rather than carried on the draw: the camera moves
+            // every frame, so a stored distance would be the one field in the
+            // list that had to be rewritten for every mesh every frame --
+            // which is the cost this list exists to avoid. Only the handful
+            // that survive the blend filter need it.
+            let dist_sq = |m: &RealGameMeshDraw| {
+                let d = [
+                    m.bounds_centre[0] - camera_pos[0],
+                    m.bounds_centre[1] - camera_pos[1],
+                    m.bounds_centre[2] - camera_pos[2],
+                ];
+                d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+            };
             let mut blended: Vec<&RealGameMeshDraw> = meshes
                 .iter()
+                .flatten()
                 .filter(|m| m.is_blend && draws_in_view(m, scope_pass, &planes))
                 .collect();
-            blended.sort_by(|a, b| b.camera_dist_sq.total_cmp(&a.camera_dist_sq));
+            blended.sort_by(|a, b| dist_sq(b).total_cmp(&dist_sq(a)));
             if !blended.is_empty() {
                 encoder.set_depth_stencil_state(&self.blend_depth_state);
                 encoder.set_render_pipeline_state(sponza_blend_pipeline.unwrap_or(sponza_pipeline.unwrap()));
@@ -2621,7 +2664,7 @@ impl NativeMetalRenderer {
         encoder: &metal::RenderCommandEncoderRef,
         light_view_projection: [[f32; 4]; 4],
         extracted: &[super::skinned_actor::SkinnedActorDraw],
-        real_game_meshes: Option<&[RealGameMeshDraw]>,
+        real_game_meshes: Option<&[Option<RealGameMeshDraw>]>,
     ) {
         if let Some(meshes) = real_game_meshes.filter(|_| self.shadow_static) {
             if let Some(pipeline) = self.shadow_pipeline_sponza.as_ref() {
@@ -2629,7 +2672,7 @@ impl NativeMetalRenderer {
                 // The light's frustum, not the camera's: a wall behind the
                 // player still casts into the map in front of them.
                 let planes = frustum_planes(light_view_projection);
-                for m in meshes.iter().filter(|m| {
+                for m in meshes.iter().flatten().filter(|m| {
                     !m.viewmodel
                         && !m.reticle
                         && !sphere_outside(&planes, m.bounds_centre, m.bounds_radius)
@@ -2738,8 +2781,9 @@ impl NativeMetalRenderer {
 
         let now = self.start_time.elapsed().as_secs_f32();
 
-        let real_game_static_meshes: Vec<super::snapshot::ExtractedMesh>;
-        let mut snapshot_meshes_changed = false;
+        let mesh_updates: Vec<(usize, super::snapshot::ExtractedMesh)>;
+        let mesh_slots: usize;
+        let meshes_freed: bool;
 
         let mut real_game_extracted: Vec<super::skinned_actor::SkinnedActorDraw> = Vec::new();
         {
@@ -2784,8 +2828,9 @@ impl NativeMetalRenderer {
                 if snapshot.light_quality > 0 { 1.0 } else { 0.0 },
                 snapshot.point_light_quality.min(5) as f32 / 5.0,
             );
-            real_game_static_meshes = snapshot.static_meshes;
-            snapshot_meshes_changed = snapshot.static_meshes_changed;
+            mesh_updates = snapshot.static_mesh_updates;
+            mesh_slots = snapshot.static_mesh_slots;
+            meshes_freed = snapshot.static_mesh_freed;
 
             real_game_extracted.extend(snapshot.skinned_actors.into_iter().map(|actor| {
                 super::skinned_actor::SkinnedActorDraw {
@@ -2857,13 +2902,9 @@ impl NativeMetalRenderer {
         let drawable_texture = drawable.texture();
         let texture = offscreen.unwrap_or_else(|| drawable_texture.to_owned());
 
-        // Only when the mesh set actually changed. Two HashSets built over every
-        // mesh and two cache sweeps, every frame, to reconcile a list that for a
-        // static map is identical to last frame's -- desert_swift_metal builds
-        // its texture list once at load and never looks again.
         // UI textures first and unconditionally: a HUD image appears and goes
-        // without the mesh set moving at all, and gating this on meshes would
-        // leave it unuploaded until something else happened to change.
+        // without any mesh slot moving, and gating this on meshes would leave
+        // it unuploaded until something else happened to change.
         for image in self.ui_generic_nodes.iter().filter_map(|node| node.image.as_ref()) {
             if !self.real_game_textures.contains_key(&image.id) {
                 let uploaded = match image.astc {
@@ -2878,121 +2919,136 @@ impl NativeMetalRenderer {
             }
         }
 
-        if snapshot_meshes_changed {
-            let used_texture_ids: std::collections::HashSet<AssetId<Image>> = real_game_static_meshes
-                .iter()
-                .flat_map(|mesh| [mesh.texture.as_ref(), mesh.normal_texture.as_ref()].into_iter().flatten())
-                .chain(self.ui_generic_nodes.iter().filter_map(|node| node.image.as_ref()))
-                .map(|t| t.id)
-                .collect();
-            self.real_game_textures.retain(|id, _| used_texture_ids.contains(id));
+        // Rebuild only the slots the host reports as changed. For a map that
+        // is standing still that is none of them, and the list below is the
+        // one prepared last frame -- which is the whole point. The old code
+        // rebuilt all 1544 draws every frame: a hash lookup for the geometry,
+        // two more for the textures, a matrix and a bounding sphere, into a
+        // freshly allocated Vec. desert_swift_metal builds its list once at
+        // load and the per-frame cost of preparing it is zero.
+        if self.real_game_draws.len() < mesh_slots {
+            self.real_game_draws.resize(mesh_slots, None);
+        }
+        for (slot, mesh) in &mesh_updates {
+            if !mesh.visible {
+                self.real_game_draws[*slot] = None;
+                continue;
+            }
+            for t in [mesh.texture.as_ref(), mesh.normal_texture.as_ref()].into_iter().flatten() {
+                if !self.real_game_textures.contains_key(&t.id) {
+                    let uploaded = match t.astc {
+                        Some(block) => super::metal_texture::upload_astc(
+                            &self.device, t.width, t.height, &t.rgba, block,
+                        ),
+                        None => super::metal_texture::upload_texture(
+                            &self.device, t.width, t.height, &t.rgba,
+                        ),
+                    };
+                    self.real_game_textures.insert(t.id, uploaded);
+                    timings.texture_uploads += 1;
+                }
+            }
 
-            let used_mesh_ids: std::collections::HashSet<AssetId<Mesh>> =
-                real_game_static_meshes.iter().map(|mesh| mesh.mesh_id).collect();
-            self.gpu_transformed_mesh_cache.retain(|id, _| used_mesh_ids.contains(id));
-
-            for mesh in &real_game_static_meshes {
-                for t in [mesh.texture.as_ref(), mesh.normal_texture.as_ref()].into_iter().flatten() {
-                    if !self.real_game_textures.contains_key(&t.id) {
-                        let uploaded = match t.astc {
-                            Some(block) => super::metal_texture::upload_astc(
-                                &self.device, t.width, t.height, &t.rgba, block,
-                            ),
-                            None => super::metal_texture::upload_texture(
-                                &self.device, t.width, t.height, &t.rgba,
-                            ),
-                        };
-                        self.real_game_textures.insert(t.id, uploaded);
-                        timings.texture_uploads += 1;
+            let geometry = match self.gpu_transformed_mesh_cache.get(&mesh.mesh_id) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let (verts, indices) = bake_local_mesh_vertices(mesh);
+                    if verts.is_empty() || indices.is_empty() {
+                        bevy::log::warn!(
+                            "empty mesh skipped: positions={} normals={} uvs={} indices={}",
+                            mesh.positions.len(),
+                            mesh.normals.len(),
+                            mesh.uvs.len(),
+                            mesh.indices.len()
+                        );
+                        self.real_game_draws[*slot] = None;
+                        continue;
                     }
+                    let buffer = self.device.new_buffer_with_data(
+                        verts.as_ptr() as *const _,
+                        (verts.len() * std::mem::size_of::<super::gltf_scene::GltfVertex>()) as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    let index_buffer = self.device.new_buffer_with_data(
+                        indices.as_ptr() as *const _,
+                        (indices.len() * std::mem::size_of::<u32>()) as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    let (centre, radius) = local_bounds(&mesh.positions);
+                    let entry = (buffer, index_buffer, indices.len(), verts.len(), centre, radius);
+                    self.gpu_transformed_mesh_cache.insert(mesh.mesh_id, entry.clone());
+                    entry
+                }
+            };
+            let (vertex_buffer, index_buffer, index_count, unique_vertices, local_centre, local_radius) =
+                geometry;
+            self.real_game_draws[*slot] = Some(RealGameMeshDraw {
+                viewmodel: mesh.viewmodel,
+                reticle: mesh.reticle,
+                vertex_buffer,
+                index_buffer,
+                index_count,
+                unique_vertices,
+                base_color_factor: mesh.base_color,
+                emissive: mesh.emissive,
+                texture: mesh.texture.as_ref().and_then(|t| self.real_game_textures.get(&t.id).cloned()),
+                normal_texture: mesh
+                    .normal_texture
+                    .as_ref()
+                    .and_then(|t| self.real_game_textures.get(&t.id).cloned()),
+                mesh_id: mesh.mesh_id,
+                texture_id: mesh.texture.as_ref().map(|t| t.id),
+                normal_texture_id: mesh.normal_texture.as_ref().map(|t| t.id),
+                is_blend: mesh.is_blend && !self.force_opaque,
+                bounds_centre: mesh.transform.transform_point(bevy::math::Vec3::from_array(local_centre)).to_array(),
+                // The largest scale on any axis. A non-uniform scale makes
+                // the true bound an ellipsoid; taking the largest keeps the
+                // sphere conservative, which is the only direction a cull
+                // is allowed to be wrong in.
+                bounds_radius: local_radius * mesh.transform.scale.abs().max_element(),
+                model_matrix: mesh.transform.to_matrix().to_cols_array_2d(),
+            });
+        }
+
+        // A slot emptying is the only way an asset can stop being used, so
+        // this is the only frame on which a sweep can find anything.
+        if meshes_freed {
+            let live_textures: std::collections::HashSet<AssetId<Image>> = self
+                .real_game_draws
+                .iter()
+                .flatten()
+                .flat_map(|d| [d.texture_id, d.normal_texture_id].into_iter().flatten())
+                .chain(self.ui_generic_nodes.iter().filter_map(|node| node.image.as_ref()).map(|t| t.id))
+                .collect();
+            self.real_game_textures.retain(|id, _| live_textures.contains(id));
+
+            let live_meshes: std::collections::HashSet<AssetId<Mesh>> =
+                self.real_game_draws.iter().flatten().map(|d| d.mesh_id).collect();
+            self.gpu_transformed_mesh_cache.retain(|id, _| live_meshes.contains(id));
+        }
+
+        let real_game_meshes_opt =
+            if self.real_game_draws.is_empty() { None } else { Some(self.real_game_draws.as_slice()) };
+        timings.bookkeeping_ms = bookkeeping_start.elapsed().as_secs_f32() * 1000.0;
+        timings.cached_textures = self.real_game_textures.len();
+        timings.cached_meshes = self.gpu_transformed_mesh_cache.len();
+        // Five walks over the whole list for numbers nobody reads unless
+        // NATIVE_STATS is set. Counting the draws cost more than some of the
+        // passes being counted.
+        if self.stats_enabled {
+            let planes = frustum_planes(self.last_main_view_projection.get());
+            for m in self.real_game_draws.iter().flatten() {
+                timings.draws += 1;
+                if !draws_in_view(m, false, &planes) {
+                    timings.culled += 1;
+                }
+                timings.vertices_drawn += m.index_count;
+                timings.unique_vertices += m.unique_vertices;
+                if m.is_blend {
+                    timings.blend_draws += 1;
                 }
             }
         }
-        let real_game_meshes: Vec<RealGameMeshDraw> = real_game_static_meshes
-            .iter()
-            .filter(|mesh| mesh.visible)
-            .filter_map(|mesh| {
-
-                let (vertex_buffer, index_buffer, index_count, unique_vertices, local_centre, local_radius) = match self.gpu_transformed_mesh_cache.get(&mesh.mesh_id) {
-                    Some(cached) => cached.clone(),
-                    None => {
-                        let (verts, indices) = bake_local_mesh_vertices(mesh);
-                        if verts.is_empty() || indices.is_empty() {
-                            bevy::log::warn!(
-                                "empty mesh skipped: positions={} normals={} uvs={} indices={}",
-                                mesh.positions.len(),
-                                mesh.normals.len(),
-                                mesh.uvs.len(),
-                                mesh.indices.len()
-                            );
-                            return None;
-                        }
-                        let buffer = self.device.new_buffer_with_data(
-                            verts.as_ptr() as *const _,
-                            (verts.len() * std::mem::size_of::<super::gltf_scene::GltfVertex>()) as u64,
-                            MTLResourceOptions::StorageModeShared,
-                        );
-                        let index_buffer = self.device.new_buffer_with_data(
-                            indices.as_ptr() as *const _,
-                            (indices.len() * std::mem::size_of::<u32>()) as u64,
-                            MTLResourceOptions::StorageModeShared,
-                        );
-                        let (centre, radius) = local_bounds(&mesh.positions);
-                        let entry = (buffer, index_buffer, indices.len(), verts.len(), centre, radius);
-                        self.gpu_transformed_mesh_cache.insert(mesh.mesh_id, entry.clone());
-                        entry
-                    }
-                };
-                let model_matrix = mesh.transform.to_matrix().to_cols_array_2d();
-                let texture = mesh.texture.as_ref().and_then(|t| self.real_game_textures.get(&t.id));
-                let normal_texture = mesh.normal_texture.as_ref().and_then(|t| self.real_game_textures.get(&t.id));
-                let d = [
-                    mesh.transform.translation.x - self.camera_position[0],
-                    mesh.transform.translation.y - self.camera_position[1],
-                    mesh.transform.translation.z - self.camera_position[2],
-                ];
-                Some(RealGameMeshDraw {
-                    viewmodel: mesh.viewmodel,
-                    reticle: mesh.reticle,
-                    vertex_buffer,
-                    index_buffer,
-                    index_count,
-                    unique_vertices,
-                    base_color_factor: mesh.base_color,
-                    emissive: mesh.emissive,
-                    texture,
-                    normal_texture,
-                    is_blend: mesh.is_blend && !self.force_opaque,
-                    camera_dist_sq: d[0] * d[0] + d[1] * d[1] + d[2] * d[2],
-                    bounds_centre: mesh.transform.transform_point(bevy::math::Vec3::from_array(local_centre)).to_array(),
-                    // The largest scale on any axis. A non-uniform scale makes
-                    // the true bound an ellipsoid; taking the largest keeps the
-                    // sphere conservative, which is the only direction a cull
-                    // is allowed to be wrong in.
-                    bounds_radius: local_radius * mesh.transform.scale.abs().max_element(),
-                    model_matrix,
-                })
-            })
-            .collect();
-        let real_game_meshes_opt =
-            if real_game_meshes.is_empty() { None } else { Some(real_game_meshes.as_slice()) };
-        timings.bookkeeping_ms = bookkeeping_start.elapsed().as_secs_f32() * 1000.0;
-        timings.draws = real_game_meshes.len();
-        // What the main camera's frustum keeps. Reported rather than inferred:
-        // the whole point of the test is a number that moves as the player
-        // turns, and a count that never moves means it is not working.
-        {
-            let planes = frustum_planes(self.last_main_view_projection.get());
-            timings.culled = real_game_meshes
-                .iter()
-                .filter(|m| !draws_in_view(m, false, &planes))
-                .count();
-        }
-        timings.cached_textures = self.real_game_textures.len();
-        timings.cached_meshes = self.gpu_transformed_mesh_cache.len();
-        timings.vertices_drawn = real_game_meshes.iter().map(|m| m.index_count).sum();
-        timings.blend_draws = real_game_meshes.iter().filter(|m| m.is_blend).count();
-        timings.unique_vertices = real_game_meshes.iter().map(|m| m.unique_vertices).sum();
         let passes_start = std::time::Instant::now();
 
         let aspect = width as f32 / height.max(1) as f32;

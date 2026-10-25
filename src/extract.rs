@@ -54,6 +54,9 @@ pub struct StaticMeshCache {
     pub slot_of: std::collections::HashMap<bevy::ecs::entity::Entity, usize>,
     pub free_slots: Vec<usize>,
     pub awaiting_textures: std::collections::HashSet<bevy::ecs::entity::Entity>,
+    /// Slots written since the host last drained this. The renderer holds the
+    /// rest from previous frames, so only these need to cross.
+    pub dirty: Vec<usize>,
 }
 
 pub fn decode_texture(
@@ -161,14 +164,19 @@ pub fn store_extracted_mesh(
         cache.awaiting_textures.remove(&entity);
     }
     match slot {
-        Some(slot) => cache.entries[slot] = extracted,
+        Some(slot) => {
+            cache.entries[slot] = extracted;
+            cache.dirty.push(slot);
+        }
         None => match cache.free_slots.pop() {
             Some(slot) => {
                 cache.slot_of.insert(entity, slot);
                 cache.entries[slot] = extracted;
+                cache.dirty.push(slot);
             }
             None => {
                 cache.slot_of.insert(entity, cache.entries.len());
+                cache.dirty.push(cache.entries.len());
                 cache.entries.push(extracted);
             }
         },
