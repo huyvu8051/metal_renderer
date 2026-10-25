@@ -2258,6 +2258,25 @@ impl NativeMetalRenderer {
             frame_capture,
         }
     }
+    /// Place the camera outright, for a scripted path. `update_camera` integrates input and
+    /// cannot express "be exactly here, looking exactly there" -- which a repeatable
+    /// measurement needs, since the same path has to be flown every run.
+    pub fn set_camera(&mut self, position: [f32; 3], yaw: f32, pitch: f32) {
+        self.camera_position = position;
+        self.camera_yaw = yaw;
+        self.camera_pitch = pitch;
+    }
+
+    /// Yaw and pitch that aim the camera from `eye` at `target`, in this renderer's convention:
+    /// forward is `(-sin(yaw)cos(pitch), sin(pitch), -cos(yaw)cos(pitch))`, so the two negations
+    /// below are the same ones that appear there.
+    pub fn aim_angles(eye: [f32; 3], target: [f32; 3]) -> (f32, f32) {
+        let d = [target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]];
+        let length = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
+        let d = [d[0] / length, d[1] / length, d[2] / length];
+        (( -d[0]).atan2(-d[2]), d[1].clamp(-1.0, 1.0).asin())
+    }
+
 
     pub fn update_camera(&mut self, forward: f32, strafe: f32, look_dx: f32, look_dy: f32, dt: f32) {
         self.camera_yaw -= look_dx * 0.005;
