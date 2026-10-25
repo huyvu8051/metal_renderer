@@ -1761,7 +1761,7 @@ impl NativeMetalRenderer {
         let raw_layer: *mut Object = msg_send![view, layer];
 
         let retained: *mut Object = msg_send![raw_layer, retain];
-        let layer = MetalLayer::from_ptr(retained as *mut CAMetalLayer);
+        let layer = unsafe { MetalLayer::from_ptr(retained as *mut CAMetalLayer) };
         layer.set_device(&device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
 
@@ -2719,7 +2719,7 @@ impl NativeMetalRenderer {
 
         let now = self.start_time.elapsed().as_secs_f32();
 
-        let mut real_game_static_meshes: Vec<super::snapshot::ExtractedMesh> = Vec::new();
+        let real_game_static_meshes: Vec<super::snapshot::ExtractedMesh>;
 
         let mut real_game_extracted: Vec<super::skinned_actor::SkinnedActorDraw> = Vec::new();
         {

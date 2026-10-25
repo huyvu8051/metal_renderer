@@ -1,7 +1,7 @@
 
 use bevy::asset::{AssetId, Assets, Handle};
 use bevy::camera::visibility::InheritedVisibility;
-use bevy::ecs::query::{Changed, Or, With, Without};
+use bevy::ecs::query::Without;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Query, Res, ResMut};
 use bevy::image::Image;
