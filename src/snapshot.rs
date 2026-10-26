@@ -59,11 +59,6 @@ pub struct ExtractedMesh {
     /// view and the gun is not part of that world: drawn there it appears
     /// inside its own eyepiece.
     pub viewmodel: bool,
-    /// True for the reticle, on SCOPE_RETICLE_LAYER. The mirror image of the
-    /// above -- it belongs to the scope view only, and the main camera does
-    /// not carry that layer, so a red mark floating in the middle of the
-    /// screen while hip firing is what happens when nobody tells it.
-    pub reticle: bool,
 
     pub is_blend: bool,
 
@@ -83,7 +78,6 @@ pub struct CameraSnapshot {
 
     pub ads_blend: f32,
 
-    pub scope_zoom: f32,
 
     pub wall_raise: f32,
 }
@@ -202,7 +196,6 @@ impl Default for CameraSnapshot {
             pitch: 0.0,
             fov: std::f32::consts::FRAC_PI_4,
             ads_blend: 0.0,
-            scope_zoom: 8.0,
             wall_raise: 0.0,
         }
     }

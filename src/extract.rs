@@ -177,7 +177,6 @@ pub fn store_extracted_mesh(
     used_texture_ids: &mut std::collections::HashSet<AssetId<Image>>,
     geometry_already_uploaded: &impl Fn(AssetId<Mesh>) -> bool,
     viewmodel: bool,
-    reticle: bool,
     // Runs on the finished mesh before it is cached. The host uses it to
     // attach the map's baked lightmap, which this crate knows nothing about --
     // it is not in the glTF and not in any Bevy component.
@@ -187,7 +186,7 @@ pub fn store_extracted_mesh(
     let previous = slot.and_then(|slot| cache.entries.get(slot));
     let Some((extracted, textures_pending)) = extract_one_mesh(
         mesh3d, material3d, transform, visibility, meshes, materials, images,
-        texture_cache, used_texture_ids, geometry_already_uploaded, previous, viewmodel, reticle,
+        texture_cache, used_texture_ids, geometry_already_uploaded, previous, viewmodel,
     ) else {
         return;
     };
@@ -238,7 +237,6 @@ pub fn extract_one_mesh(
     geometry_already_uploaded: &impl Fn(AssetId<Mesh>) -> bool,
     previous: Option<&ExtractedMesh>,
     viewmodel: bool,
-    reticle: bool,
 ) -> Option<(ExtractedMesh, bool)> {
     let material = materials.get(&material3d.0)?;
     let mesh_id = mesh3d.id();
@@ -293,7 +291,6 @@ pub fn extract_one_mesh(
         // nothing about it.
         uv2: Vec::new(),
         viewmodel,
-        reticle,
         positions,
         normals,
         uvs,

@@ -11,7 +11,7 @@ use metal::{
 };
 use objc::{runtime::Object, *};
 
-use super::metal_math::{look_at, mat_mul, orthographic, perspective, transform_point};
+use super::metal_math::{look_at, mat_mul, orthographic, perspective};
 use super::snapshot::{ExtractedMesh, LightSnapshot, RenderSnapshot, SunSnapshot};
 
 /// Per-pixel work compiled into the scene shader. These are compile-time
@@ -667,7 +667,6 @@ const RENDER_SCALE_MIN_PX: u64 = 64;
 const SHADOW_HALF_EXTENT: f32 = 22.0;
 const SHADOW_DISTANCE: f32 = 40.0;
 
-const SCOPE_TEXTURE_SIZE: u64 = 512;
 
 const MSAA_SAMPLE_COUNT: u64 = 4;
 
@@ -715,71 +714,7 @@ struct LineUniforms {
     pub view_projection: [[f32; 4]; 4],
 }
 
-const QUAD_SHADER_SOURCE: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
 
-struct QuadVertex {
-    packed_float4 position;
-    packed_float2 uv;
-};
-
-struct QuadVertexOut {
-    float4 position [[position]];
-    float2 uv;
-};
-
-// `position` is already real homogeneous clip space (not NDC) — see this
-// shader's own Rust-side doc comment (build_projected_quad) for why: the
-// real-game scope PIP now projects each of the lens quad's 4 real 3D
-// world-space corners individually (full rotation + perspective), instead
-// of building a flat always-facing-camera NDC quad and faking rotation/
-// distance with 2D tricks, so each vertex needs its own `w` for Metal's
-// rasterizer to interpolate `uv` perspective-correctly across the quad —
-// passing it straight through here (not wrapping z=0/w=1 like before) is
-// what makes that work. The demo-probe's still-flat fixed quad just
-// carries z=0/w=1 baked into its own vertex data instead.
-vertex QuadVertexOut quad_vertex(uint vid [[vertex_id]],
-                                  const device QuadVertex *verts [[buffer(0)]]) {
-    QuadVertexOut out;
-    QuadVertex v = verts[vid];
-    out.position = v.position;
-    out.uv = v.uv;
-    return out;
-}
-
-fragment float4 quad_fragment(QuadVertexOut in [[stage_in]],
-                               texture2d<float> tex [[texture(0)]],
-                               sampler texSampler [[sampler(0)]]) {
-    // Circular mask (real game's scope lens is round, fitting the scope
-    // tube opening — see update_scope_lens/SCOPE_LENS_SIZE in
-    // crates/client/src/lib.rs) instead of a square PIP box. Discarding
-    // outside the inscribed circle just leaves whatever the main camera
-    // already drew showing through.
-    float2 centered = in.uv - float2(0.5, 0.5);
-    if (length(centered) > 0.5) {
-        discard_fragment();
-    }
-    float4 color = tex.sample(texSampler, in.uv);
-    // Real game's ScopeLens is AlphaMode::Blend glass (see
-    // build_sponza_descriptor's own comment) — the world behind the gun
-    // still shows through it faintly, unlike a fully opaque disk. This
-    // quad is drawn last, straight over the already-finished main-camera
-    // frame (see render_frame), so blending it at less than full alpha
-    // here lets that same "world already drawn underneath" bleed through
-    // the scope picture the same way, instead of painting over it
-    // completely opaque like before.
-    color.a = 0.88;
-    return color;
-}
-"#;
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct QuadVertex {
-    position: [f32; 4],
-    uv: [f32; 2],
-}
 
 const UI_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
@@ -1072,18 +1007,11 @@ pub struct NativeMetalRenderer {
     skinned_pipeline_no_msaa: Option<RenderPipelineState>,
 
     skinned_models: super::skinned_actor::SkinnedModelRegistry,
-    scope_color_texture: metal::Texture,
 
-    scope_color_texture_msaa: metal::Texture,
-    scope_depth_texture: metal::Texture,
 
-    scope_depth_texture_no_msaa: metal::Texture,
     debug_lines: Vec<super::snapshot::DebugLine>,
     line_pipeline: Option<RenderPipelineState>,
     line_pipeline_no_msaa: Option<RenderPipelineState>,
-    quad_pipeline: Option<RenderPipelineState>,
-    quad_pipeline_no_msaa: Option<RenderPipelineState>,
-    quad_vertex_buffer: metal::Buffer,
     start_time: std::time::Instant,
 
 
@@ -1124,12 +1052,8 @@ pub struct NativeMetalRenderer {
     real_game_camera_rotation: [f32; 4],
 
     real_game_ads_blend: f32,
-    real_game_scope_zoom: f32,
     real_game_wall_raise: f32,
 
-    real_game_scope_eye: [f32; 3],
-    real_game_scope_rotation: [f32; 4],
-    real_game_scope_active: bool,
     screen_capture: Option<crate::screen_capture::ScreenCapture>,
     joint_ring: JointRing,
     /// Kept so the cull count can be reported against the same planes the
@@ -1145,13 +1069,10 @@ pub struct NativeMetalRenderer {
     probe_origin_spacing: [f32; 4],
     probe_dims: [f32; 4],
     probe_sampler: Option<metal::SamplerState>,
-    real_game_scope_fov: f32,
     /// The main view's vertical fov, taken from the snapshot each frame.
     real_game_fov: f32,
 
-    real_game_scope_lens_world_pos: [f32; 3],
 
-    real_game_scope_lens_local_rotation: [f32; 4],
 
     real_game_light: LightUniform,
 
@@ -1209,34 +1130,6 @@ fn bake_local_mesh_vertices(mesh: &ExtractedMesh) -> (Vec<super::gltf_scene::Glt
     (verts, indices)
 }
 
-fn build_projected_quad(
-    device: &Device,
-    view_projection: [[f32; 4]; 4],
-    center: [f32; 3],
-    world_rotation: bevy::math::Quat,
-    radius: f32,
-) -> metal::Buffer {
-    let right = (world_rotation * bevy::math::Vec3::X) * radius;
-    let up = (world_rotation * bevy::math::Vec3::Y) * radius;
-    let center = bevy::math::Vec3::from_array(center);
-
-    let corner = |signed_right: f32, signed_up: f32, uv: [f32; 2]| {
-        let world = center + right * signed_right + up * signed_up;
-        QuadVertex { position: transform_point(view_projection, world.to_array()), uv }
-    };
-    let (tl, tr, br, bl) = (
-        corner(-1.0, 1.0, [0.0, 0.0]),
-        corner(1.0, 1.0, [1.0, 0.0]),
-        corner(1.0, -1.0, [1.0, 1.0]),
-        corner(-1.0, -1.0, [0.0, 1.0]),
-    );
-    let verts = [bl, br, tr, bl, tr, tl];
-    device.new_buffer_with_data(
-        verts.as_ptr() as *const _,
-        (verts.len() * std::mem::size_of::<QuadVertex>()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    )
-}
 
 fn ndc_ui_rect(x: f32, y: f32, w: f32, h: f32, view_w: f32, view_h: f32, uv: [[f32; 2]; 4]) -> [UiVertex; 6] {
     let ndc_x0 = (x / view_w) * 2.0 - 1.0;
@@ -1527,20 +1420,13 @@ fn capture_if_due(
     }
 }
 
-fn draws_in_pass(mesh: &RealGameMeshDraw, scope_pass: bool) -> bool {
-    if scope_pass { !mesh.viewmodel } else { !mesh.reticle }
-}
-
 /// Layer filter and frustum test together, so no caller can remember one and
 /// forget the other.
 ///
 /// The viewmodel is exempt: it is positioned relative to the camera and sits
 /// inside the near plane, where a conservative sphere test rejects it.
-fn draws_in_view(mesh: &RealGameMeshDraw, scope_pass: bool, planes: &[[f32; 4]; 6]) -> bool {
-    draws_in_pass(mesh, scope_pass)
-        && (mesh.viewmodel
-            || mesh.reticle
-            || !sphere_outside(planes, mesh.bounds_centre, mesh.bounds_radius))
+fn draws_in_view(mesh: &RealGameMeshDraw, planes: &[[f32; 4]; 6]) -> bool {
+    mesh.viewmodel || !sphere_outside(planes, mesh.bounds_centre, mesh.bounds_radius)
 }
 
 
@@ -1681,8 +1567,6 @@ struct RealGameMeshDraw {
     /// Skipped by the scope pass: the gun is not part of the world the scope
     /// is looking at, and drawn there it shows up inside its own eyepiece.
     viewmodel: bool,
-    /// Skipped by every other pass: the reticle is the scope's own mark.
-    reticle: bool,
     vertex_buffer: metal::Buffer,
     index_buffer: metal::Buffer,
     index_count: usize,
@@ -2074,41 +1958,6 @@ impl NativeMetalRenderer {
         }
 
 
-        let scope_color_descriptor = metal::TextureDescriptor::new();
-        scope_color_descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        scope_color_descriptor.set_width(SCOPE_TEXTURE_SIZE);
-        scope_color_descriptor.set_height(SCOPE_TEXTURE_SIZE);
-        scope_color_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-        scope_color_descriptor.set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
-        let scope_color_texture = device.new_texture(&scope_color_descriptor);
-
-        let scope_color_msaa_descriptor = metal::TextureDescriptor::new();
-        scope_color_msaa_descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
-        scope_color_msaa_descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        scope_color_msaa_descriptor.set_width(SCOPE_TEXTURE_SIZE);
-        scope_color_msaa_descriptor.set_height(SCOPE_TEXTURE_SIZE);
-        scope_color_msaa_descriptor.set_sample_count(MSAA_SAMPLE_COUNT);
-        scope_color_msaa_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-        scope_color_msaa_descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
-        let scope_color_texture_msaa = device.new_texture(&scope_color_msaa_descriptor);
-
-        let scope_depth_descriptor = metal::TextureDescriptor::new();
-        scope_depth_descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
-        scope_depth_descriptor.set_pixel_format(MTLPixelFormat::Depth32Float);
-        scope_depth_descriptor.set_width(SCOPE_TEXTURE_SIZE);
-        scope_depth_descriptor.set_height(SCOPE_TEXTURE_SIZE);
-        scope_depth_descriptor.set_sample_count(MSAA_SAMPLE_COUNT);
-        scope_depth_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-        scope_depth_descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
-        let scope_depth_texture = device.new_texture(&scope_depth_descriptor);
-
-        let scope_depth_no_msaa_descriptor = metal::TextureDescriptor::new();
-        scope_depth_no_msaa_descriptor.set_pixel_format(MTLPixelFormat::Depth32Float);
-        scope_depth_no_msaa_descriptor.set_width(SCOPE_TEXTURE_SIZE);
-        scope_depth_no_msaa_descriptor.set_height(SCOPE_TEXTURE_SIZE);
-        scope_depth_no_msaa_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-        scope_depth_no_msaa_descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
-        let scope_depth_texture_no_msaa = device.new_texture(&scope_depth_no_msaa_descriptor);
 
         fn build_quad_descriptor(vertex_fn: &metal::FunctionRef, fragment_fn: &metal::FunctionRef, sample_count: u64) -> RenderPipelineDescriptor {
             let descriptor = RenderPipelineDescriptor::new();
@@ -2151,37 +2000,7 @@ impl NativeMetalRenderer {
                 }
             };
 
-        let (quad_pipeline, quad_pipeline_no_msaa) =
-            match device.new_library_with_source(QUAD_SHADER_SOURCE, &compile_options) {
-                Ok(library) => {
-                    let vertex_fn = library.get_function("quad_vertex", None).unwrap();
-                    let fragment_fn = library.get_function("quad_fragment", None).unwrap();
-                    let msaa_descriptor = build_quad_descriptor(&vertex_fn, &fragment_fn, MSAA_SAMPLE_COUNT);
-                    let no_msaa_descriptor = build_quad_descriptor(&vertex_fn, &fragment_fn, 1);
-                    (
-                        device.new_render_pipeline_state(&msaa_descriptor).ok(),
-                        device.new_render_pipeline_state(&no_msaa_descriptor).ok(),
-                    )
-                }
-                Err(err) => {
-                    eprintln!("[native_metal_renderer] quad shader compile failed: {err}");
-                    (None, None)
-                }
-            };
 
-        let quad_verts = [
-            QuadVertex { position: [0.55, 0.55, 0.0, 1.0], uv: [0.0, 0.0] },
-            QuadVertex { position: [0.95, 0.55, 0.0, 1.0], uv: [1.0, 0.0] },
-            QuadVertex { position: [0.95, 0.95, 0.0, 1.0], uv: [1.0, 1.0] },
-            QuadVertex { position: [0.55, 0.55, 0.0, 1.0], uv: [0.0, 0.0] },
-            QuadVertex { position: [0.95, 0.95, 0.0, 1.0], uv: [1.0, 1.0] },
-            QuadVertex { position: [0.55, 0.95, 0.0, 1.0], uv: [0.0, 1.0] },
-        ];
-        let quad_vertex_buffer = device.new_buffer_with_data(
-            quad_verts.as_ptr() as *const _,
-            (quad_verts.len() * std::mem::size_of::<QuadVertex>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
 
         let blit_pipeline = match device.new_library_with_source(BLIT_SHADER_SOURCE, &compile_options) {
             Ok(library) => {
@@ -2304,16 +2123,9 @@ impl NativeMetalRenderer {
             skinned_pipeline,
             skinned_pipeline_no_msaa,
             skinned_models,
-            scope_color_texture,
-            scope_color_texture_msaa,
-            scope_depth_texture,
-            scope_depth_texture_no_msaa,
             debug_lines: Vec::new(),
             line_pipeline,
             line_pipeline_no_msaa,
-            quad_pipeline,
-            quad_pipeline_no_msaa,
-            quad_vertex_buffer,
             start_time: std::time::Instant::now(),
 
             real_game_textures: std::collections::HashMap::new(),
@@ -2324,11 +2136,7 @@ impl NativeMetalRenderer {
             blend_slots: std::collections::BTreeSet::new(),
             real_game_camera_rotation: [0.0, 0.0, 0.0, 1.0],
             real_game_ads_blend: 0.0,
-            real_game_scope_zoom: 8.0,
             real_game_wall_raise: 0.0,
-            real_game_scope_eye: [0.0, 0.0, 0.0],
-            real_game_scope_rotation: [0.0, 0.0, 0.0, 1.0],
-            real_game_scope_active: false,
             screen_capture: crate::screen_capture::ScreenCapture::from_env(),
             joint_ring,
             last_main_view_projection: std::cell::Cell::new([[0.0; 4]; 4]),
@@ -2337,10 +2145,7 @@ impl NativeMetalRenderer {
             probe_origin_spacing: [0.0; 4],
             probe_dims: [1.0; 4],
             probe_sampler: None,
-            real_game_scope_fov: 12.0_f32.to_radians(),
             real_game_fov: std::f32::consts::FRAC_PI_4,
-            real_game_scope_lens_world_pos: [0.0, 0.0, 0.0],
-            real_game_scope_lens_local_rotation: [0.0, 0.0, 0.0, 1.0],
             real_game_light: FALLBACK_LIGHT,
             ui_pipeline,
             ui_pipeline_no_msaa,
@@ -2434,7 +2239,6 @@ impl NativeMetalRenderer {
         // The scope pass leaves the weapon out; every other pass leaves the
         // reticle out. Both are render layers the windowed build has and the
         // snapshot had no way to express until now.
-        scope_pass: bool,
     ) {
         let shadows_on = self.shadow_quality_requested > 0;
         let sponza_pipeline = match (msaa_enabled, shadows_on) {
@@ -2495,12 +2299,9 @@ impl NativeMetalRenderer {
             );
         };
 
-        // Once per pass, not per mesh: the scope looks at the world from a
-        // second point of view and gets its own six planes.
+        // Once per pass, not per mesh.
         let planes = frustum_planes(view_projection);
-        if !scope_pass {
-            self.last_main_view_projection.set(view_projection);
-        }
+        self.last_main_view_projection.set(view_projection);
 
         if let Some(meshes) = real_game_meshes {
 
@@ -2515,7 +2316,7 @@ impl NativeMetalRenderer {
             for m in meshes
                 .iter()
                 .flatten()
-                .filter(|m| !m.is_blend && draws_in_view(m, scope_pass, &planes))
+                .filter(|m| !m.is_blend && draws_in_view(m, &planes))
             {
                 draw_static_mesh(m);
             }
@@ -2641,7 +2442,7 @@ impl NativeMetalRenderer {
                 .blend_slots
                 .iter()
                 .filter_map(|slot| meshes.get(*slot).and_then(|m| m.as_ref()))
-                .filter(|m| draws_in_view(m, scope_pass, &planes))
+                .filter(|m| draws_in_view(m, &planes))
                 .collect();
             blended.sort_by(|a, b| dist_sq(b).total_cmp(&dist_sq(a)));
             if !blended.is_empty() {
@@ -2752,7 +2553,6 @@ impl NativeMetalRenderer {
                 let planes = frustum_planes(light_view_projection);
                 for m in meshes.iter().flatten().filter(|m| {
                     !m.viewmodel
-                        && !m.reticle
                         && !sphere_outside(&planes, m.bounds_centre, m.bounds_radius)
                 }) {
                     let uniforms = SponzaShadowUniforms { light_view_projection, model_matrix: m.model_matrix };
@@ -2879,18 +2679,7 @@ impl NativeMetalRenderer {
                 self.camera_pitch = cam.pitch;
                 self.real_game_camera_rotation = cam.rotation;
                 self.real_game_ads_blend = cam.ads_blend;
-                self.real_game_scope_zoom = cam.scope_zoom;
                 self.real_game_wall_raise = cam.wall_raise;
-            }
-            if let Some(scope_cam) = &snapshot.scope_camera {
-                self.real_game_scope_eye = scope_cam.eye;
-                self.real_game_scope_rotation = scope_cam.rotation;
-                self.real_game_scope_active = scope_cam.active;
-                self.real_game_scope_fov = scope_cam.fov;
-                self.real_game_scope_lens_world_pos = scope_cam.lens_world_pos;
-                self.real_game_scope_lens_local_rotation = scope_cam.lens_local_rotation;
-            } else {
-                self.real_game_scope_active = false;
             }
             self.real_game_light = LightUniform::from_snapshots(
                 snapshot.light.as_ref(),
@@ -3076,7 +2865,6 @@ impl NativeMetalRenderer {
             }
             let draw = RealGameMeshDraw {
                 viewmodel: mesh.viewmodel,
-                reticle: mesh.reticle,
                 vertex_buffer,
                 index_buffer,
                 index_count,
@@ -3130,7 +2918,7 @@ impl NativeMetalRenderer {
             let planes = frustum_planes(self.last_main_view_projection.get());
             for m in self.real_game_draws.iter().flatten() {
                 timings.draws += 1;
-                if !draws_in_view(m, false, &planes) {
+                if !draws_in_view(m, &planes) {
                     timings.culled += 1;
                 }
                 timings.vertices_drawn += m.index_count;
@@ -3179,22 +2967,6 @@ impl NativeMetalRenderer {
         let light = self.real_game_light;
         let view_projection = mat_mul(proj, view);
 
-        let show_scope = if is_real_game { self.real_game_scope_active } else { true };
-        let (scope_view, scope_fov) = if is_real_game {
-            let rotation = bevy::math::Quat::from_array(self.real_game_scope_rotation);
-            let scope_forward = (rotation * bevy::math::Vec3::NEG_Z).to_array();
-            let scope_up = (rotation * bevy::math::Vec3::Y).to_array();
-            let scope_center = [
-                self.real_game_scope_eye[0] + scope_forward[0],
-                self.real_game_scope_eye[1] + scope_forward[1],
-                self.real_game_scope_eye[2] + scope_forward[2],
-            ];
-            (look_at(self.real_game_scope_eye, scope_center, scope_up), self.real_game_scope_fov)
-        } else {
-            (view, 12.0_f32.to_radians())
-        };
-        let scope_proj = perspective(scope_fov, 1.0, 0.05, far);
-        let scope_view_projection = mat_mul(scope_proj, scope_view);
 
         let extracted: Vec<super::skinned_actor::SkinnedActorDraw> = real_game_extracted;
 
@@ -3275,46 +3047,6 @@ impl NativeMetalRenderer {
             self.last_command_buffers.push(("point shadow", point_shadow_command_buffer.to_owned()));
         }
 
-        if show_scope {
-            let scope_pass_descriptor = RenderPassDescriptor::new();
-            let scope_color = scope_pass_descriptor.color_attachments().object_at(0).unwrap();
-            if msaa_enabled {
-
-                scope_color.set_texture(Some(&self.scope_color_texture_msaa));
-                scope_color.set_resolve_texture(Some(&self.scope_color_texture));
-                scope_color.set_store_action(MTLStoreAction::MultisampleResolve);
-            } else {
-                scope_color.set_texture(Some(&self.scope_color_texture));
-                scope_color.set_store_action(MTLStoreAction::Store);
-            }
-            scope_color.set_load_action(MTLLoadAction::Clear);
-            scope_color.set_clear_color(MTLClearColor::new(0.05, 0.05, 0.05, 1.0));
-            let scope_depth = scope_pass_descriptor.depth_attachment().unwrap();
-            scope_depth.set_texture(Some(if msaa_enabled { &self.scope_depth_texture } else { &self.scope_depth_texture_no_msaa }));
-            scope_depth.set_load_action(MTLLoadAction::Clear);
-            scope_depth.set_store_action(MTLStoreAction::DontCare);
-            scope_depth.set_clear_depth(1.0);
-
-            let scope_command_buffer = self.queue.new_command_buffer();
-            let scope_encoder = scope_command_buffer.new_render_command_encoder(scope_pass_descriptor);
-            scope_encoder.set_depth_stencil_state(&self.depth_state);
-            self.draw_scene(
-                scope_encoder,
-                scope_view_projection,
-                light,
-                &extracted,
-                now,
-                real_game_meshes_opt,
-                msaa_enabled,
-                light_view_projection,
-                point_light_view_projection,
-                self.camera_position,
-                true,
-            );
-            scope_encoder.end_encoding();
-            scope_command_buffer.commit();
-            self.last_command_buffers.push(("scope", scope_command_buffer.to_owned()));
-        }
 
         let pass_descriptor = RenderPassDescriptor::new();
         let color_attachment = pass_descriptor.color_attachments().object_at(0).unwrap();
@@ -3353,41 +3085,8 @@ impl NativeMetalRenderer {
             light_view_projection,
             point_light_view_projection,
             self.camera_position,
-            false,
         );
 
-        if show_scope {
-            let quad_pipeline_ref = if msaa_enabled { &self.quad_pipeline } else { &self.quad_pipeline_no_msaa };
-            if let Some(quad_pipeline) = quad_pipeline_ref {
-
-                const SCOPE_LENS_RADIUS: f32 = 0.015;
-                let real_game_quad_buffer = is_real_game.then(|| {
-                    let camera_rotation = bevy::math::Quat::from_array(self.real_game_camera_rotation);
-                    let lens_local_rotation = bevy::math::Quat::from_array(self.real_game_scope_lens_local_rotation);
-                    let world_rotation = camera_rotation * lens_local_rotation;
-                    build_projected_quad(
-                        &self.device,
-                        view_projection,
-                        self.real_game_scope_lens_world_pos,
-                        world_rotation,
-                        SCOPE_LENS_RADIUS,
-                    )
-                });
-                let quad_buffer = real_game_quad_buffer.as_ref().unwrap_or(&self.quad_vertex_buffer);
-                // Depth tested on purpose, inheriting the scene's state: the
-                // lens sits inside the scope tube, so the tube's near rim
-                // draws over its edge and frames it, while the rest of the
-                // tube is behind and loses. Turning the test off instead --
-                // which an M4 with FORCE_SCOPE seemed to call for, since it
-                // has no tube and the lens lands nowhere sensible -- throws
-                // that framing away.
-                encoder.set_render_pipeline_state(quad_pipeline);
-                encoder.set_vertex_buffer(0, Some(quad_buffer), 0);
-                encoder.set_fragment_texture(0, Some(&self.scope_color_texture));
-                encoder.set_fragment_sampler_state(0, Some(&self.sponza_sampler));
-                encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 6);
-            }
-        }
 
         let ui_pipeline_ref = if msaa_enabled { &self.ui_pipeline } else { &self.ui_pipeline_no_msaa };
         if let Some(ui_pipeline) = ui_pipeline_ref {
