@@ -208,7 +208,12 @@ struct VertexOut {
     float3 worldPos;
     float3 normal;
     float2 uv;
+    // Only the normal-mapping variant reads this, and everything declared
+    // here is written into the tile parameter buffer for every vertex in the
+    // frame -- 16 of 72 bytes, on a map whose materials carry no normal map.
+#if FEATURE_NORMAL_MAP
     float4 tangent;
+#endif
     float2 uv2;
 };
 
@@ -223,6 +228,7 @@ vertex VertexOut sponza_vertex(uint vid [[vertex_id]],
     out.worldPos = worldPos4.xyz;
     out.normal = (mesh.normalMatrix * float4(float3(short3(v.normal.xyz)) * (1.0 / 32767.0), 0.0)).xyz;
     out.uv = float2(v.uv);
+#if FEATURE_NORMAL_MAP
     // xyz rotates like the normal above (w=0 drops translation); w itself
     // is glTF's handedness sign, not a spatial component, so it carries
     // straight through unchanged — same convention bake_static_mesh_
@@ -230,6 +236,7 @@ vertex VertexOut sponza_vertex(uint vid [[vertex_id]],
     float3 tangentDir = float3(short3(v.tangent.xyz)) * (1.0 / 32767.0);
     float3 rotatedTangent = (mesh.modelMatrix * float4(tangentDir, 0.0)).xyz;
     out.tangent = float4(rotatedTangent, float(v.tangent.w) * (1.0 / 32767.0));
+#endif
     out.uv2 = float2(ushort2(v.uv2)) * (1.0 / 65535.0);
     return out;
 }
