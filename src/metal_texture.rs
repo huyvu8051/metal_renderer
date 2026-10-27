@@ -17,7 +17,7 @@ pub fn upload_texture_with_mips(
     rgba: &[u8],
     mipmapped: bool,
 ) -> metal::Texture {
-    let levels = if mipmapped { mip_level_count(width, height) } else { 1 };
+    let levels = if mipmapped { mip_level_count_for(width, height) } else { 1 };
 
     let descriptor = metal::TextureDescriptor::new();
     descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
@@ -48,7 +48,7 @@ pub fn upload_texture_with_mips(
     texture
 }
 
-fn mip_level_count(width: u32, height: u32) -> u32 {
+fn mip_level_count_for(width: u32, height: u32) -> u32 {
     32 - width.max(height).max(1).leading_zeros()
 }
 
@@ -90,6 +90,7 @@ pub fn upload_astc(
     height: u32,
     blocks: &[u8],
     block: crate::snapshot::AstcBlock,
+    mip_level_count: u32,
 ) -> metal::Texture {
     use crate::snapshot::AstcBlock as B;
     let (format, bw, bh) = match block {
@@ -107,28 +108,106 @@ pub fn upload_astc(
         ),
     };
 
+    // KTX2 ships these with a full chain and Bevy hands all of it over
+    // mip-major. Uploading level zero alone left every minified surface
+    // sampling the top level -- see upload_texture's own note on what that
+    // costs in texture-cache bandwidth.
+    let levels = mip_level_count.max(1).min(mip_level_count_for(width, height));
     let descriptor = metal::TextureDescriptor::new();
     descriptor.set_pixel_format(format);
     descriptor.set_width(width as u64);
     descriptor.set_height(height as u64);
-    descriptor.set_mipmap_level_count(1);
+    descriptor.set_mipmap_level_count(levels as u64);
     descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
     let texture = device.new_texture(&descriptor);
 
-    // ASTC is 16 bytes a block whatever the block size, so a row of blocks is
-    // 16 * ceil(width / block_width).
-    let bytes_per_row = 16 * width.div_ceil(bw) as u64;
-    texture.replace_region(
-        metal::MTLRegion {
-            origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
-            size: metal::MTLSize { width: width as u64, height: height as u64, depth: 1 },
-        },
-        0,
-        blocks.as_ptr() as *const _,
-        bytes_per_row,
-    );
-    let _ = bh;
+    let mut offset = 0usize;
+    let (mut level_width, mut level_height) = (width, height);
+    let mut slices: Vec<&[u8]> = Vec::with_capacity(levels as usize);
+    for _ in 0..levels {
+        // ASTC is 16 bytes a block whatever the block size, so a row of blocks
+        // is 16 * ceil(width / block_width).
+        let level_bytes =
+            16 * level_width.div_ceil(bw) as usize * level_height.div_ceil(bh) as usize;
+        // A truncated chain is a broken asset, not a reason to read past the
+        // end of it.
+        if offset + level_bytes > blocks.len() {
+            break;
+        }
+        slices.push(&blocks[offset..offset + level_bytes]);
+        offset += level_bytes;
+        level_width = (level_width / 2).max(1);
+        level_height = (level_height / 2).max(1);
+    }
+    write_astc_levels(&texture, width, height, bw, bh, &slices);
     texture
+}
+
+/// Uploads a chain whose levels are not contiguous -- KTX2 keeps a byte offset
+/// per level and is free to store them in any order.
+pub fn upload_astc_from_levels(
+    device: &Device,
+    width: u32,
+    height: u32,
+    block: crate::snapshot::AstcBlock,
+    levels: &[&[u8]],
+) -> metal::Texture {
+    use crate::snapshot::AstcBlock as B;
+    let (format, bw, bh) = match block {
+        B::B4x4 { srgb } => (
+            if srgb { MTLPixelFormat::ASTC_4x4_sRGB } else { MTLPixelFormat::ASTC_4x4_LDR },
+            4, 4,
+        ),
+        B::B6x6 { srgb } => (
+            if srgb { MTLPixelFormat::ASTC_6x6_sRGB } else { MTLPixelFormat::ASTC_6x6_LDR },
+            6, 6,
+        ),
+        B::B8x8 { srgb } => (
+            if srgb { MTLPixelFormat::ASTC_8x8_sRGB } else { MTLPixelFormat::ASTC_8x8_LDR },
+            8, 8,
+        ),
+    };
+    let descriptor = metal::TextureDescriptor::new();
+    descriptor.set_pixel_format(format);
+    descriptor.set_width(width as u64);
+    descriptor.set_height(height as u64);
+    descriptor.set_mipmap_level_count(levels.len().max(1) as u64);
+    descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+    let texture = device.new_texture(&descriptor);
+    write_astc_levels(&texture, width, height, bw, bh, levels);
+    texture
+}
+
+fn write_astc_levels(
+    texture: &metal::Texture,
+    width: u32,
+    height: u32,
+    bw: u32,
+    bh: u32,
+    levels: &[&[u8]],
+) {
+    let (mut level_width, mut level_height) = (width, height);
+    for (level, bytes) in levels.iter().enumerate() {
+        let bytes_per_row = 16 * level_width.div_ceil(bw) as u64;
+        if bytes.len() < bytes_per_row as usize * level_height.div_ceil(bh) as usize {
+            break;
+        }
+        texture.replace_region(
+            metal::MTLRegion {
+                origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                size: metal::MTLSize {
+                    width: level_width as u64,
+                    height: level_height as u64,
+                    depth: 1,
+                },
+            },
+            level as u64,
+            bytes.as_ptr() as *const _,
+            bytes_per_row,
+        );
+        level_width = (level_width / 2).max(1);
+        level_height = (level_height / 2).max(1);
+    }
 }
 
 /// What a KTX2 file says about itself, enough to hand its blocks to Metal.
@@ -136,9 +215,10 @@ pub struct Ktx2 {
     pub width: u32,
     pub height: u32,
     pub block: crate::snapshot::AstcBlock,
-    /// Level 0 only. The rest of the chain is there in the file but Metal
-    /// wants each level uploaded on its own, and nothing here needs them yet.
-    pub level0: std::ops::Range<usize>,
+    /// Byte range of each mip level, largest first -- the order KTX2's own
+    /// level index uses, whatever order the data itself sits in. Metal wants
+    /// each level uploaded on its own, so they stay separate.
+    pub levels: Vec<std::ops::Range<usize>>,
 }
 
 /// Reads the header rather than decoding anything: these are ASTC blocks the
@@ -189,10 +269,14 @@ pub fn parse_ktx2(data: &[u8]) -> Option<Ktx2> {
     if data.len() < index + level_count as usize * 24 {
         return None;
     }
-    let offset = u64_at(index)? as usize;
-    let length = u64_at(index + 8)? as usize;
-    if offset + length > data.len() {
-        return None;
+    let mut levels = Vec::with_capacity(level_count as usize);
+    for level in 0..level_count as usize {
+        let offset = u64_at(index + level * 24)? as usize;
+        let length = u64_at(index + level * 24 + 8)? as usize;
+        if offset + length > data.len() {
+            return None;
+        }
+        levels.push(offset..offset + length);
     }
-    Some(Ktx2 { width, height, block, level0: offset..offset + length })
+    Some(Ktx2 { width, height, block, levels })
 }

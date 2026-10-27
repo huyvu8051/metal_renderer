@@ -76,6 +76,15 @@ impl LightUniform {
             Some(s) => (s.direction, [s.color[0], s.color[1], s.color[2], 0.0]),
             None => (FALLBACK_LIGHT.sun_dir, FALLBACK_LIGHT.sun_color),
         };
+        // Once here rather than per fragment: the snapshot's own direction is a
+        // unit vector already, but FALLBACK_LIGHT's is 0.816 long, so the
+        // shaders had to normalize a value that never changes within a pass.
+        let sun_len = (sun_dir[0] * sun_dir[0] + sun_dir[1] * sun_dir[1] + sun_dir[2] * sun_dir[2]).sqrt();
+        let sun_dir = if sun_len > 1e-6 {
+            [sun_dir[0] / sun_len, sun_dir[1] / sun_len, sun_dir[2] / sun_len]
+        } else {
+            sun_dir
+        };
         let sun_color = [
             sun_color_base[0] * sun_fraction,
             sun_color_base[1] * sun_fraction,
@@ -153,16 +162,21 @@ using namespace metal;
 
 struct Vertex {
     packed_float3 position;
-    packed_float3 normal;
+    // snorm16/unorm16, packed_ so the offsets match Rust's repr(C) instead of
+    // short4's own 8-byte alignment. See GltfVertex (gltf_scene.rs).
+    packed_short4 normal;
     packed_float2 uv;
     // xyz = tangent direction, w = handedness — see GltfVertex's own doc
     // comment (gltf_scene.rs) for where this gets baked (CPU-side, world
     // space, same as position/normal above).
-    packed_float4 tangent;
-    packed_float2 uv2;
+    packed_short4 tangent;
+    packed_ushort2 uv2;
 };
 
-struct Uniforms {
+// Split so the per-pass half is bound once instead of copied into every
+// draw: of the 432 bytes this used to be, only the 160 in MeshUniforms vary
+// per mesh.
+struct PassUniforms {
     float4x4 viewProjection;
     packed_float3 lightPos;
     float lightRange;
@@ -170,8 +184,6 @@ struct Uniforms {
     packed_float3 sunDir;
     float _sunPad;
     float4 sunColor;
-    float4 baseColorFactor;
-    float4 emissive;
     // Shadow-mapping/specular pass (see SHADOW_SHADER_SOURCE's own doc
     // comment) — lightViewProjection/pointLightViewProjection re-project
     // worldPos into the sun's and the point light's own shadow maps to
@@ -182,6 +194,11 @@ struct Uniforms {
     float4x4 pointLightViewProjection;
     packed_float3 cameraPos;
     float _cameraPad;
+};
+
+struct MeshUniforms {
+    float4 baseColorFactor;
+    float4 emissive;
     float4x4 modelMatrix;
     float4x4 normalMatrix;
 };
@@ -197,21 +214,23 @@ struct VertexOut {
 
 vertex VertexOut sponza_vertex(uint vid [[vertex_id]],
                                 const device Vertex *verts [[buffer(0)]],
-                                constant Uniforms &uniforms [[buffer(1)]]) {
+                                constant PassUniforms &pass [[buffer(1)]],
+                                constant MeshUniforms &mesh [[buffer(2)]]) {
     VertexOut out;
     Vertex v = verts[vid];
-    float4 worldPos4 = uniforms.modelMatrix * float4(float3(v.position), 1.0);
-    out.position = uniforms.viewProjection * worldPos4;
+    float4 worldPos4 = mesh.modelMatrix * float4(float3(v.position), 1.0);
+    out.position = pass.viewProjection * worldPos4;
     out.worldPos = worldPos4.xyz;
-    out.normal = (uniforms.normalMatrix * float4(float3(v.normal), 0.0)).xyz;
+    out.normal = (mesh.normalMatrix * float4(float3(short3(v.normal.xyz)) * (1.0 / 32767.0), 0.0)).xyz;
     out.uv = float2(v.uv);
     // xyz rotates like the normal above (w=0 drops translation); w itself
     // is glTF's handedness sign, not a spatial component, so it carries
     // straight through unchanged — same convention bake_static_mesh_
     // vertices/bake_local_mesh_vertices already use for tangent.w.
-    float3 rotatedTangent = (uniforms.modelMatrix * float4(v.tangent.xyz, 0.0)).xyz;
-    out.tangent = float4(rotatedTangent, v.tangent.w);
-    out.uv2 = float2(v.uv2);
+    float3 tangentDir = float3(short3(v.tangent.xyz)) * (1.0 / 32767.0);
+    float3 rotatedTangent = (mesh.modelMatrix * float4(tangentDir, 0.0)).xyz;
+    out.tangent = float4(rotatedTangent, float(v.tangent.w) * (1.0 / 32767.0));
+    out.uv2 = float2(ushort2(v.uv2)) * (1.0 / 65535.0);
     return out;
 }
 
@@ -254,7 +273,8 @@ static inline float sample_shadow(float4x4 light_view_projection, float3 worldPo
 }
 
 fragment float4 sponza_fragment(VertexOut in [[stage_in]],
-                                 constant Uniforms &uniforms [[buffer(1)]],
+                                 constant PassUniforms &pass [[buffer(1)]],
+                                 constant MeshUniforms &mesh [[buffer(2)]],
                                  texture2d<float> baseColorTexture [[texture(0)]],
                                  sampler texSampler [[sampler(0)]],
                                  depth2d<float> shadowMap [[texture(1)]],
@@ -287,8 +307,9 @@ fragment float4 sponza_fragment(VertexOut in [[stage_in]],
     float3 normal = geometricNormal;
 #endif
 
-    float3 viewDir = normalize(float3(uniforms.cameraPos) - in.worldPos);
-    float3 toSun = -normalize(float3(uniforms.sunDir));
+    float3 viewDir = normalize(float3(pass.cameraPos) - in.worldPos);
+    // Normalized host-side in LightUniform::from_snapshots.
+    float3 toSun = -float3(pass.sunDir);
 
     // See SHADOW_SHADER_SOURCE's own doc comment for how these were
     // written — same lightViewProjection convention used to read them back
@@ -303,11 +324,9 @@ fragment float4 sponza_fragment(VertexOut in [[stage_in]],
     // having two *different* real shadows on desktop that this renderer
     // only drew one of.
 #if FEATURE_SHADOWS
-    float sunShadow = sample_shadow(uniforms.lightViewProjection, in.worldPos, shadowMap, shadowSampler);
-    float pointShadowFactor = sample_shadow(uniforms.pointLightViewProjection, in.worldPos, pointShadowMap, shadowSampler);
+    float sunShadow = sample_shadow(pass.lightViewProjection, in.worldPos, shadowMap, shadowSampler);
 #else
     float sunShadow = 1.0;
-    float pointShadowFactor = 1.0;
 #endif
 
     float sunDiffuse = max(dot(normal, toSun), 0.0) * sunShadow;
@@ -318,17 +337,28 @@ fragment float4 sponza_fragment(VertexOut in [[stage_in]],
 #endif
 
 #if FEATURE_POINT_LIGHT
-    float3 toLight = float3(uniforms.lightPos) - in.worldPos;
+    float3 toLight = float3(pass.lightPos) - in.worldPos;
     float dist = length(toLight);
-    float atten = clamp(1.0 - dist / max(uniforms.lightRange, 0.0001), 0.0, 1.0);
+    float atten = clamp(1.0 - dist / max(pass.lightRange, 0.0001), 0.0, 1.0);
     atten *= atten;
-    float3 pointDir = toLight / max(dist, 0.0001);
-    float pointDiffuse = max(dot(normal, pointDir), 0.0) * atten * pointShadowFactor;
-#if FEATURE_SPECULAR
-    float pointSpecular = pointDiffuse > 0.0 ? pow(max(dot(normal, normalize(pointDir + viewDir)), 0.0), kShininess) * atten * pointShadowFactor : 0.0;
-#else
+    float pointDiffuse = 0.0;
     float pointSpecular = 0.0;
+    // Both terms below are multiplied by atten, so out of the light's reach
+    // every one of them is zero and the shadow lookup that feeds them is a
+    // fetch whose result is thrown away. There is no point light at all for
+    // most of a frame -- it is the muzzle flash.
+    if (atten > 0.0) {
+#if FEATURE_SHADOWS
+        float pointShadowFactor = sample_shadow(pass.pointLightViewProjection, in.worldPos, pointShadowMap, shadowSampler);
+#else
+        float pointShadowFactor = 1.0;
 #endif
+        float3 pointDir = toLight / max(dist, 0.0001);
+        pointDiffuse = max(dot(normal, pointDir), 0.0) * atten * pointShadowFactor;
+#if FEATURE_SPECULAR
+        pointSpecular = pointDiffuse > 0.0 ? pow(max(dot(normal, normalize(pointDir + viewDir)), 0.0), kShininess) * atten * pointShadowFactor : 0.0;
+#endif
+    }
 #else
     float pointDiffuse = 0.0;
     float pointSpecular = 0.0;
@@ -342,11 +372,11 @@ fragment float4 sponza_fragment(VertexOut in [[stage_in]],
     // below crushed it to near-invisible on dark surfaces (the gun's black
     // metal) even though the math upstream was already computing it
     // correctly — this was the actual bug, not a missing specular term.
-    float3 diffuseTerm = clamp(uniforms.sunColor.rgb * sunDiffuse + uniforms.lightColor.rgb * pointDiffuse, 0.0, 1.0);
-    float3 specularTerm = (uniforms.sunColor.rgb * sunSpecular + uniforms.lightColor.rgb * pointSpecular) * kSpecularStrength;
+    float3 diffuseTerm = clamp(pass.sunColor.rgb * sunDiffuse + pass.lightColor.rgb * pointDiffuse, 0.0, 1.0);
+    float3 specularTerm = (pass.sunColor.rgb * sunSpecular + pass.lightColor.rgb * pointSpecular) * kSpecularStrength;
 
     float4 texColor = baseColorTexture.sample(texSampler, in.uv);
-    float4 baseColor = texColor * uniforms.baseColorFactor;
+    float4 baseColor = texColor * mesh.baseColorFactor;
 
     // The 0.35 this replaces was the whole of indirect light: a corner and an
     // open wall were handed the same fill. R is baked ambient occlusion, G is
@@ -373,15 +403,16 @@ fragment float4 sponza_fragment(VertexOut in [[stage_in]],
     // as bright/glowing instead of flat, matching bevy_render's own
     // emissive-is-additive-to-lit-color behavior minus the actual bloom
     // blur/threshold pass.
-    lit += uniforms.emissive.rgb;
+    lit += mesh.emissive.rgb;
     return float4(lit, baseColor.a);
 #endif
 }
 "#;
 
+/// Mirrors PassUniforms in SPONZA_SHADER_SOURCE. Bound once per pass.
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct SponzaUniforms {
+pub struct SponzaPassUniforms {
     pub view_projection: [[f32; 4]; 4],
     pub light_pos: [f32; 3],
     pub light_range: f32,
@@ -389,13 +420,19 @@ pub struct SponzaUniforms {
     pub sun_dir: [f32; 3],
     pub _sun_pad: f32,
     pub sun_color: [f32; 4],
-    pub base_color_factor: [f32; 4],
-    pub emissive: [f32; 4],
     pub light_view_projection: [[f32; 4]; 4],
     pub point_light_view_projection: [[f32; 4]; 4],
     pub camera_pos: [f32; 3],
     pub _camera_pad: f32,
+}
 
+/// Mirrors MeshUniforms in SPONZA_SHADER_SOURCE. The only half that changes
+/// between draws.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct SponzaMeshUniforms {
+    pub base_color_factor: [f32; 4],
+    pub emissive: [f32; 4],
     pub model_matrix: [[f32; 4]; 4],
     pub normal_matrix: [[f32; 4]; 4],
 }
@@ -412,16 +449,16 @@ struct Vertex {
     packed_float4 weights;
 };
 
-struct Uniforms {
+// Split for the same reason as SPONZA_SHADER_SOURCE's: only modelMatrix and
+// baseColorFactor change between draws.
+struct PassUniforms {
     float4x4 viewProjection;
-    float4x4 modelMatrix;
     packed_float3 lightPos;
     float lightRange;
     float4 lightColor;
     packed_float3 sunDir;
     float _sunPad;
     float4 sunColor;
-    float4 baseColorFactor;
     // Shadow-mapping/specular pass — see SPONZA_SHADER_SOURCE's own
     // Uniforms doc comment, identical reasoning applies here.
     float4x4 lightViewProjection;
@@ -435,6 +472,11 @@ struct Uniforms {
     float4 probeDims;
 };
 
+struct MeshUniforms {
+    float4x4 modelMatrix;
+    float4 baseColorFactor;
+};
+
 struct VertexOut {
     float4 position [[position]];
     float3 worldPos;
@@ -444,8 +486,9 @@ struct VertexOut {
 
 vertex VertexOut skinned_vertex(uint vid [[vertex_id]],
                                  const device Vertex *verts [[buffer(0)]],
-                                 constant Uniforms &uniforms [[buffer(1)]],
-                                 const device float4x4 *jointMatrices [[buffer(2)]]) {
+                                 constant PassUniforms &pass [[buffer(1)]],
+                                 const device float4x4 *jointMatrices [[buffer(2)]],
+                                 constant MeshUniforms &mesh [[buffer(3)]]) {
     Vertex v = verts[vid];
     float4x4 skin =
         v.weights.x * jointMatrices[v.joints.x] +
@@ -457,10 +500,10 @@ vertex VertexOut skinned_vertex(uint vid [[vertex_id]],
     float3 skinnedNormal = normalize((skin * float4(float3(v.normal), 0.0)).xyz);
 
     VertexOut out;
-    float4 worldPos4 = uniforms.modelMatrix * skinnedPos;
-    out.position = uniforms.viewProjection * worldPos4;
+    float4 worldPos4 = mesh.modelMatrix * skinnedPos;
+    out.position = pass.viewProjection * worldPos4;
     out.worldPos = worldPos4.xyz;
-    out.normal = (uniforms.modelMatrix * float4(skinnedNormal, 0.0)).xyz;
+    out.normal = (mesh.modelMatrix * float4(skinnedNormal, 0.0)).xyz;
     out.uv = float2(v.uv);
     return out;
 }
@@ -488,7 +531,8 @@ static inline float sample_shadow(float4x4 light_view_projection, float3 worldPo
 }
 
 fragment float4 skinned_fragment(VertexOut in [[stage_in]],
-                                  constant Uniforms &uniforms [[buffer(1)]],
+                                  constant PassUniforms &pass [[buffer(1)]],
+                                 constant MeshUniforms &mesh [[buffer(3)]],
                                   texture2d<float> baseColorTexture [[texture(0)]],
                                   sampler texSampler [[sampler(0)]],
                                   depth2d<float> shadowMap [[texture(1)]],
@@ -501,7 +545,7 @@ fragment float4 skinned_fragment(VertexOut in [[stage_in]],
     // person who hits this class of bug) found via a 3-step device/
     // Simulator console+shader bisection: (1) raw texColor sample alone →
     // colorful — rules out texture binding/decode; (2) texColor *
-    // uniforms.baseColorFactor → solid black — isolates the bug to reading
+    // mesh.baseColorFactor → solid black — isolates the bug to reading
     // baseColorFactor itself; (3) a lone `float3 lightDir` field (MSL
     // default alignment 16 per-member — NOT the GLSL std140 "vec3 forces
     // the next struct member to a 16-byte boundary" rule some docs
@@ -514,22 +558,23 @@ fragment float4 skinned_fragment(VertexOut in [[stage_in]],
     // layout and MSL's (see LightUniform's own doc comment) instead of
     // re-deriving this by trial and error again.
     float3 normal = normalize(in.normal);
-    float3 viewDir = normalize(float3(uniforms.cameraPos) - in.worldPos);
-    float3 toSun = -normalize(float3(uniforms.sunDir));
+    float3 viewDir = normalize(float3(pass.cameraPos) - in.worldPos);
+    // Normalized host-side in LightUniform::from_snapshots.
+    float3 toSun = -float3(pass.sunDir);
 
     // See SHADOW_SHADER_SOURCE's own doc comment for how these were
     // written, and SPONZA_SHADER_SOURCE's matching block for why both the
     // sun AND the point light get their own real shadow here (not
     // repeated per-shader).
-    float sunShadow = sample_shadow(uniforms.lightViewProjection, in.worldPos, shadowMap, shadowSampler);
-    float pointShadowFactor = sample_shadow(uniforms.pointLightViewProjection, in.worldPos, pointShadowMap, shadowSampler);
+    float sunShadow = sample_shadow(pass.lightViewProjection, in.worldPos, shadowMap, shadowSampler);
+    float pointShadowFactor = sample_shadow(pass.pointLightViewProjection, in.worldPos, pointShadowMap, shadowSampler);
 
     float sunDiffuse = max(dot(normal, toSun), 0.0) * sunShadow;
     float sunSpecular = sunDiffuse > 0.0 ? pow(max(dot(normal, normalize(toSun + viewDir)), 0.0), kShininess) * sunShadow : 0.0;
 
-    float3 toLight = float3(uniforms.lightPos) - in.worldPos;
+    float3 toLight = float3(pass.lightPos) - in.worldPos;
     float dist = length(toLight);
-    float atten = clamp(1.0 - dist / max(uniforms.lightRange, 0.0001), 0.0, 1.0);
+    float atten = clamp(1.0 - dist / max(pass.lightRange, 0.0001), 0.0, 1.0);
     atten *= atten;
     float3 pointDir = toLight / max(dist, 0.0001);
     float pointDiffuse = max(dot(normal, pointDir), 0.0) * atten * pointShadowFactor;
@@ -538,11 +583,11 @@ fragment float4 skinned_fragment(VertexOut in [[stage_in]],
     // See SPONZA_SHADER_SOURCE's matching block for why specular is kept
     // separate from baseColor's multiply instead of folded into the same
     // term (that crushed it to near-invisible on dark surfaces).
-    float3 diffuseTerm = clamp(uniforms.sunColor.rgb * sunDiffuse + uniforms.lightColor.rgb * pointDiffuse, 0.0, 1.0);
-    float3 specularTerm = (uniforms.sunColor.rgb * sunSpecular + uniforms.lightColor.rgb * pointSpecular) * kSpecularStrength;
+    float3 diffuseTerm = clamp(pass.sunColor.rgb * sunDiffuse + pass.lightColor.rgb * pointDiffuse, 0.0, 1.0);
+    float3 specularTerm = (pass.sunColor.rgb * sunSpecular + pass.lightColor.rgb * pointSpecular) * kSpecularStrength;
 
     float4 texColor = baseColorTexture.sample(texSampler, in.uv);
-    float4 baseColor = texColor * uniforms.baseColorFactor;
+    float4 baseColor = texColor * mesh.baseColorFactor;
 
     // The light this thing is standing in, read out of the probe grid.
     //
@@ -552,12 +597,12 @@ fragment float4 skinned_fragment(VertexOut in [[stage_in]],
     // normal picks three of them and weights by how much it faces each.
     float ambient = 0.35;
     float sunMask = 1.0;
-    if (uniforms.probeOriginSpacing.w > 0.0) {
-        float3 cell = (in.worldPos - uniforms.probeOriginSpacing.xyz)
-                    / uniforms.probeOriginSpacing.w;
+    if (pass.probeOriginSpacing.w > 0.0) {
+        float3 cell = (in.worldPos - pass.probeOriginSpacing.xyz)
+                    / pass.probeOriginSpacing.w;
         // Texel centres, not corners: probe i sits at origin + i*spacing, and
         // sampling at i/dims would read half a cell short of it.
-        float3 uvw = (cell + 0.5) / uniforms.probeDims.xyz;
+        float3 uvw = (cell + 0.5) / pass.probeDims.xyz;
         if (all(uvw > 0.0) && all(uvw < 1.0)) {
             float4 pos = probesPositive.sample(probeSampler, uvw);
             float4 neg = probesNegative.sample(probeSampler, uvw);
@@ -582,7 +627,7 @@ using namespace metal;
 
 struct SponzaVertex {
     packed_float3 position;
-    packed_float3 normal;
+    packed_short4 normal;
     packed_float2 uv;
     // Unused here (this pass only needs position) but MUST stay present —
     // this struct's buffer(0) is the exact same GltfVertex-laid-out buffer
@@ -592,10 +637,10 @@ struct SponzaVertex {
     // dropping this field would silently read every vertex 16 bytes short
     // — position/normal/uv would land right, but every vertex AFTER the
     // first would already be reading from the wrong offset.
-    packed_float4 tangent;
+    packed_short4 tangent;
     // Mirrors GltfVertex, which grew a lightmap uv. Unused in this pass but
     // the stride has to match or every vertex after the first is read short.
-    packed_float2 uv2;
+    packed_ushort2 uv2;
 };
 
 struct SponzaShadowUniforms {
@@ -933,16 +978,14 @@ fn build_font_atlas(device: &Device) -> metal::Texture {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-struct SkinnedUniforms {
+struct SkinnedPassUniforms {
     pub view_projection: [[f32; 4]; 4],
-    pub model_matrix: [[f32; 4]; 4],
     pub light_pos: [f32; 3],
     pub light_range: f32,
     pub light_color: [f32; 4],
     pub sun_dir: [f32; 3],
     pub _sun_pad: f32,
     pub sun_color: [f32; 4],
-    pub base_color_factor: [f32; 4],
     pub light_view_projection: [[f32; 4]; 4],
     pub point_light_view_projection: [[f32; 4]; 4],
     pub camera_pos: [f32; 3],
@@ -954,6 +997,14 @@ struct SkinnedUniforms {
     pub probe_origin_spacing: [f32; 4],
     /// xyz the grid's size in probes, w unused.
     pub probe_dims: [f32; 4],
+}
+
+/// Mirrors MeshUniforms in SKINNED_SHADER_SOURCE.
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct SkinnedMeshUniforms {
+    pub model_matrix: [[f32; 4]; 4],
+    pub base_color_factor: [f32; 4],
 }
 
 pub struct NativeMetalRenderer {
@@ -986,6 +1037,13 @@ pub struct NativeMetalRenderer {
     sponza_blend_pipeline_no_msaa: Option<RenderPipelineState>,
     sponza_pipeline_no_shadows: Option<RenderPipelineState>,
     sponza_pipeline_no_shadows_no_msaa: Option<RenderPipelineState>,
+    /// Same shader with FEATURE_NORMAL_MAP off, for meshes that carry no
+    /// normal map. Chosen per draw; opaque_draw_order groups by it so the
+    /// pass switches pipeline once.
+    sponza_pipeline_flat_normal: Option<RenderPipelineState>,
+    sponza_pipeline_flat_normal_no_msaa: Option<RenderPipelineState>,
+    sponza_pipeline_no_shadows_flat_normal: Option<RenderPipelineState>,
+    sponza_pipeline_no_shadows_flat_normal_no_msaa: Option<RenderPipelineState>,
     sponza_sampler: metal::SamplerState,
 
     shadow_map: metal::Texture,
@@ -1018,13 +1076,16 @@ pub struct NativeMetalRenderer {
 
 
     real_game_textures: std::collections::HashMap<AssetId<Image>, metal::Texture>,
+    /// Uploaded assets no draw claims, oldest first. See release_draw_assets.
+    retained: std::collections::VecDeque<(RetainedAsset, u64)>,
+    retained_bytes: u64,
 
     /// Buffers, counts, and the mesh's own bounding sphere. The sphere lives
     /// with the geometry because that is the only time the positions are in
     /// hand -- an already-uploaded mesh arrives with its position list empty.
     gpu_transformed_mesh_cache: std::collections::HashMap<
         AssetId<Mesh>,
-        (metal::Buffer, metal::Buffer, usize, usize, [f32; 3], f32),
+        (metal::Buffer, metal::Buffer, usize, usize, [f32; 3], f32, bool),
     >,
 
     /// The draw list, indexed by the host's slot and kept between frames. Only
@@ -1048,6 +1109,15 @@ pub struct NativeMetalRenderer {
     /// could have been told. Ordered, so the pass still reaches them in slot
     /// order before sorting them back to front.
     blend_slots: std::collections::BTreeSet<usize>,
+    /// Opaque slots in draw order, grouped by texture pair. The pass itself
+    /// never sorts, and a spawning casing only appends.
+    opaque_order: Vec<usize>,
+    /// Membership by slot, so an update already in the list costs one lookup
+    /// instead of a scan.
+    opaque_in_order: Vec<bool>,
+    /// Appends and swap_removes since the last regroup, both of which leave
+    /// the tail out of texture order.
+    opaque_pending: usize,
 
     real_game_camera_rotation: [f32; 4],
 
@@ -1119,7 +1189,13 @@ fn bake_local_mesh_vertices(mesh: &ExtractedMesh) -> (Vec<super::gltf_scene::Glt
         let uv = if mesh.uvs.is_empty() { [0.0, 0.0] } else { mesh.uvs[idx] };
         let tangent = if mesh.tangents.is_empty() { [1.0, 0.0, 0.0, 1.0] } else { mesh.tangents[idx] };
         let uv2 = if mesh.uv2.is_empty() { [0.0, 0.0] } else { mesh.uv2[idx] };
-        super::gltf_scene::GltfVertex { position, normal, uv, tangent, uv2 }
+        super::gltf_scene::GltfVertex {
+            position,
+            normal: super::gltf_scene::snorm16(normal, 0.0),
+            uv,
+            tangent: super::gltf_scene::snorm16([tangent[0], tangent[1], tangent[2]], tangent[3]),
+            uv2: super::gltf_scene::unorm16(uv2),
+        }
     };
     let verts: Vec<_> = (0..mesh.positions.len()).map(vertex_at).collect();
     let indices = if mesh.indices.is_empty() {
@@ -1169,23 +1245,51 @@ fn ndc_ui_rect_rotated(center_x: f32, center_y: f32, w: f32, h: f32, rotation: f
     ]
 }
 
-fn draw_ui_quad(encoder: &metal::RenderCommandEncoderRef, verts: &[UiVertex; 6], tint: [f32; 4], texture: &metal::Texture) {
-    encoder.set_vertex_bytes(0, std::mem::size_of::<[UiVertex; 6]>() as u64, verts.as_ptr() as *const _);
-    let uniforms = UiUniforms { tint };
-    encoder.set_fragment_bytes(1, std::mem::size_of::<UiUniforms>() as u64, &uniforms as *const _ as *const _);
-    encoder.set_fragment_texture(0, Some(texture));
-    encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 6);
+/// setVertexBytes caps at 4KB, which is 42 of these six-vertex glyphs.
+const GLYPHS_PER_UI_BATCH: usize = 42;
+
+/// The pass rebinds the same font atlas for every glyph and the same white
+/// texture for every rect, and re-sets a scissor that rarely changes between
+/// nodes. Both are tracked here and skipped rather than re-recorded per draw.
+struct UiEncoder<'a> {
+    encoder: &'a metal::RenderCommandEncoderRef,
+    bound_texture: usize,
+    scissor: Option<(u64, u64, u64, u64)>,
 }
 
-fn draw_ui_verts(encoder: &metal::RenderCommandEncoderRef, verts: &[UiVertex], primitive: MTLPrimitiveType, tint: [f32; 4], texture: &metal::Texture) {
+impl UiEncoder<'_> {
+    fn set_scissor(&mut self, rect: MTLScissorRect) {
+        let key = (rect.x, rect.y, rect.width, rect.height);
+        if self.scissor == Some(key) {
+            return;
+        }
+        self.scissor = Some(key);
+        self.encoder.set_scissor_rect(rect);
+    }
+
+    fn bind(&mut self, texture: &metal::Texture) {
+        let key = texture.as_ptr() as usize;
+        if self.bound_texture == key {
+            return;
+        }
+        self.bound_texture = key;
+        self.encoder.set_fragment_texture(0, Some(texture));
+    }
+}
+
+fn draw_ui_quad(ui: &mut UiEncoder<'_>, verts: &[UiVertex; 6], tint: [f32; 4], texture: &metal::Texture) {
+    draw_ui_verts(ui, verts, MTLPrimitiveType::Triangle, tint, texture);
+}
+
+fn draw_ui_verts(ui: &mut UiEncoder<'_>, verts: &[UiVertex], primitive: MTLPrimitiveType, tint: [f32; 4], texture: &metal::Texture) {
     if verts.is_empty() {
         return;
     }
-    encoder.set_vertex_bytes(0, std::mem::size_of_val(verts) as u64, verts.as_ptr() as *const _);
+    ui.bind(texture);
+    ui.encoder.set_vertex_bytes(0, std::mem::size_of_val(verts) as u64, verts.as_ptr() as *const _);
     let uniforms = UiUniforms { tint };
-    encoder.set_fragment_bytes(1, std::mem::size_of::<UiUniforms>() as u64, &uniforms as *const _ as *const _);
-    encoder.set_fragment_texture(0, Some(texture));
-    encoder.draw_primitives(primitive, 0, verts.len() as u64);
+    ui.encoder.set_fragment_bytes(1, std::mem::size_of::<UiUniforms>() as u64, &uniforms as *const _ as *const _);
+    ui.encoder.draw_primitives(primitive, 0, verts.len() as u64);
 }
 
 /// Angle 0 = +X, increasing clockwise (+Y is down). `0.0, TAU` sweeps a full circle.
@@ -1233,7 +1337,7 @@ fn rounded_rect_corners(x: f32, y: f32, w: f32, h: f32, r: f32) -> [([f32; 2], f
     ]
 }
 
-fn draw_rounded_rect_fill(encoder: &metal::RenderCommandEncoderRef, center: [f32; 2], size: [f32; 2], radius: f32, color: [f32; 4], view_w: f32, view_h: f32, white_texture: &metal::Texture) {
+fn draw_rounded_rect_fill(ui: &mut UiEncoder<'_>, center: [f32; 2], size: [f32; 2], radius: f32, color: [f32; 4], view_w: f32, view_h: f32, white_texture: &metal::Texture) {
     const FULL_UV: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
     const CORNER_SEGMENTS: u32 = 10;
     let [cx, cy] = center;
@@ -1243,20 +1347,20 @@ fn draw_rounded_rect_fill(encoder: &metal::RenderCommandEncoderRef, center: [f32
     let y = cy - h / 2.0;
 
     let middle = ndc_ui_rect(x + r, y, w - 2.0 * r, h, view_w, view_h, FULL_UV);
-    draw_ui_quad(encoder, &middle, color, white_texture);
+    draw_ui_quad(ui, &middle, color, white_texture);
     let left = ndc_ui_rect(x, y + r, r, h - 2.0 * r, view_w, view_h, FULL_UV);
-    draw_ui_quad(encoder, &left, color, white_texture);
+    draw_ui_quad(ui, &left, color, white_texture);
     let right = ndc_ui_rect(x + w - r, y + r, r, h - 2.0 * r, view_w, view_h, FULL_UV);
-    draw_ui_quad(encoder, &right, color, white_texture);
+    draw_ui_quad(ui, &right, color, white_texture);
 
     for (corner_center, start_angle) in rounded_rect_corners(x, y, w, h, r) {
         let verts = arc_fill_verts(corner_center, r, start_angle, std::f32::consts::FRAC_PI_2, view_w, view_h, CORNER_SEGMENTS);
-        draw_ui_verts(encoder, &verts, MTLPrimitiveType::Triangle, color, white_texture);
+        draw_ui_verts(ui, &verts, MTLPrimitiveType::Triangle, color, white_texture);
     }
 }
 
 fn draw_rounded_rect_border(
-    encoder: &metal::RenderCommandEncoderRef,
+    ui: &mut UiEncoder<'_>,
     center: [f32; 2],
     size: [f32; 2],
     radius: f32,
@@ -1277,16 +1381,16 @@ fn draw_rounded_rect_border(
 
     for (ex, ey, ew, eh) in [(x + r, y, w - 2.0 * r, bw), (x + r, y + h - bw, w - 2.0 * r, bw), (x, y + r, bw, h - 2.0 * r), (x + w - bw, y + r, bw, h - 2.0 * r)] {
         let quad = ndc_ui_rect(ex, ey, ew.max(0.0), eh.max(0.0), view_w, view_h, FULL_UV);
-        draw_ui_quad(encoder, &quad, color, white_texture);
+        draw_ui_quad(ui, &quad, color, white_texture);
     }
     for (corner_center, start_angle) in rounded_rect_corners(x, y, w, h, r) {
         let verts = arc_stroke_verts(corner_center, r, (r - bw).max(0.0), start_angle, std::f32::consts::FRAC_PI_2, view_w, view_h, CORNER_SEGMENTS);
-        draw_ui_verts(encoder, &verts, MTLPrimitiveType::TriangleStrip, color, white_texture);
+        draw_ui_verts(ui, &verts, MTLPrimitiveType::TriangleStrip, color, white_texture);
     }
 }
 
 fn draw_rect_border(
-    encoder: &metal::RenderCommandEncoderRef,
+    ui: &mut UiEncoder<'_>,
     center: [f32; 2],
     size: [f32; 2],
     border_width: f32,
@@ -1303,7 +1407,7 @@ fn draw_rect_border(
     let bw = border_width.min(w / 2.0).min(h / 2.0);
     for (ex, ey, ew, eh) in [(x, y, w, bw), (x, y + h - bw, w, bw), (x, y, bw, h), (x + w - bw, y, bw, h)] {
         let quad = ndc_ui_rect(ex, ey, ew, eh, view_w, view_h, FULL_UV);
-        draw_ui_quad(encoder, &quad, color, white_texture);
+        draw_ui_quad(ui, &quad, color, white_texture);
     }
 }
 
@@ -1326,7 +1430,7 @@ fn generic_ui_scissor_rect(clip: Option<[f32; 4]>, canvas_w: f32, canvas_h: f32,
 }
 
 fn draw_generic_ui_nodes(
-    encoder: &metal::RenderCommandEncoderRef,
+    ui: &mut UiEncoder<'_>,
     nodes: &[super::snapshot::GenericUiNode],
     canvas_w: f32,
     canvas_h: f32,
@@ -1338,8 +1442,9 @@ fn draw_generic_ui_nodes(
 ) {
     const FULL_UV: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
     const CIRCLE_SEGMENTS: u32 = 40;
+    let mut glyphs: Vec<UiVertex> = Vec::new();
     for node in nodes {
-        encoder.set_scissor_rect(generic_ui_scissor_rect(node.clip_rect, canvas_w, canvas_h, view_w, view_h));
+        ui.set_scissor(generic_ui_scissor_rect(node.clip_rect, canvas_w, canvas_h, view_w, view_h));
 
         let [cx, cy] = node.center;
         let [w, h] = node.size;
@@ -1353,53 +1458,58 @@ fn draw_generic_ui_nodes(
             let radius = w.min(h) / 2.0;
             if let Some(color) = node.background_color {
                 let verts = arc_fill_verts([cx, cy], radius, 0.0, std::f32::consts::TAU, view_w, view_h, CIRCLE_SEGMENTS);
-                draw_ui_verts(encoder, &verts, MTLPrimitiveType::Triangle, color, white_texture);
+                draw_ui_verts(ui, &verts, MTLPrimitiveType::Triangle, color, white_texture);
             }
             if let Some(border_color) = node.border_color {
                 let inner = (radius - node.border_width).max(0.0);
                 let verts = arc_stroke_verts([cx, cy], radius, inner, 0.0, std::f32::consts::TAU, view_w, view_h, CIRCLE_SEGMENTS);
-                draw_ui_verts(encoder, &verts, MTLPrimitiveType::TriangleStrip, border_color, white_texture);
+                draw_ui_verts(ui, &verts, MTLPrimitiveType::TriangleStrip, border_color, white_texture);
             }
         } else if is_rounded {
             if let Some(color) = node.background_color {
-                draw_rounded_rect_fill(encoder, [cx, cy], [w, h], node.corner_radius, color, view_w, view_h, white_texture);
+                draw_rounded_rect_fill(ui, [cx, cy], [w, h], node.corner_radius, color, view_w, view_h, white_texture);
             }
             if let Some(border_color) = node.border_color {
-                draw_rounded_rect_border(encoder, [cx, cy], [w, h], node.corner_radius, node.border_width, border_color, view_w, view_h, white_texture);
+                draw_rounded_rect_border(ui, [cx, cy], [w, h], node.corner_radius, node.border_width, border_color, view_w, view_h, white_texture);
             }
         } else {
             if let Some(color) = node.background_color {
                 let quad = ndc_ui_rect_rotated(cx, cy, w, h, node.rotation, view_w, view_h, FULL_UV);
-                draw_ui_quad(encoder, &quad, color, white_texture);
+                draw_ui_quad(ui, &quad, color, white_texture);
             }
             if let Some(border_color) = node.border_color {
-                draw_rect_border(encoder, [cx, cy], [w, h], node.border_width, border_color, view_w, view_h, white_texture);
+                draw_rect_border(ui, [cx, cy], [w, h], node.border_width, border_color, view_w, view_h, white_texture);
             }
         }
 
         if let Some(image) = node.image.as_ref().and_then(|image| images.get(&image.id)) {
             let quad = ndc_ui_rect_rotated(cx, cy, w, h, node.rotation, view_w, view_h, FULL_UV);
-            draw_ui_quad(encoder, &quad, [1.0, 1.0, 1.0, 1.0], image);
+            draw_ui_quad(ui, &quad, [1.0, 1.0, 1.0, 1.0], image);
         }
         if let Some(text) = &node.text {
             let scale = text.font_size / GLYPH_H as f32;
             let upper = text.content.to_ascii_uppercase();
             let mut cursor_x = cx - w / 2.0;
             let y = cy - h / 2.0;
+            glyphs.clear();
             for ch in upper.chars() {
                 let Some(index) = glyph_index(ch) else { continue };
                 let (u0, u1) = glyph_uv_rect(index);
                 let uv = [[u0, 1.0], [u1, 1.0], [u1, 0.0], [u0, 0.0]];
                 let glyph_w = GLYPH_W as f32 * scale;
                 let glyph_h = GLYPH_H as f32 * scale;
-                let quad = ndc_ui_rect(cursor_x, y, glyph_w, glyph_h, view_w, view_h, uv);
-                draw_ui_quad(encoder, &quad, text.color, font_atlas_texture);
+                glyphs.extend_from_slice(&ndc_ui_rect(cursor_x, y, glyph_w, glyph_h, view_w, view_h, uv));
                 cursor_x += glyph_w + scale;
+            }
+            // One draw per line of text rather than per letter, up to what
+            // setVertexBytes will carry in a single call.
+            for batch in glyphs.chunks(GLYPHS_PER_UI_BATCH * 6) {
+                draw_ui_verts(ui, batch, MTLPrimitiveType::Triangle, text.color, font_atlas_texture);
             }
         }
     }
 
-    encoder.set_scissor_rect(generic_ui_scissor_rect(None, canvas_w, canvas_h, view_w, view_h));
+    ui.set_scissor(generic_ui_scissor_rect(None, canvas_w, canvas_h, view_w, view_h));
 }
 
 /// Render layers, reduced to the only question a pass has to ask.
@@ -1519,6 +1629,12 @@ fn frustum_planes(view_projection: [[f32; 4]; 4]) -> [[f32; 4]; 6] {
     planes
 }
 
+/// A zero radius means the host supplied no bounds for this actor, so it draws
+/// unconditionally rather than being culled on a sphere nobody filled in.
+fn actor_in_view(actor: &super::skinned_actor::SkinnedActorDraw, planes: &[[f32; 4]; 6]) -> bool {
+    actor.bounds_radius <= 0.0 || !sphere_outside(planes, actor.bounds_centre, actor.bounds_radius)
+}
+
 fn sphere_outside(planes: &[[f32; 4]; 6], centre: [f32; 3], radius: f32) -> bool {
     planes.iter().any(|p| {
         p[0] * centre[0] + p[1] * centre[1] + p[2] * centre[2] + p[3] < -radius
@@ -1570,6 +1686,8 @@ struct RealGameMeshDraw {
     vertex_buffer: metal::Buffer,
     index_buffer: metal::Buffer,
     index_count: usize,
+    /// u16 indices where the mesh's vertex count allows it.
+    narrow_index: bool,
     unique_vertices: usize,
     pub base_color_factor: [f32; 4],
     pub emissive: [f32; 4],
@@ -1602,35 +1720,85 @@ struct RealGameMeshDraw {
 /// Free functions rather than methods: the drawable holds a borrow of the
 /// renderer for the length of the frame, so nothing in here may take `&mut
 /// self`.
+/// GPU assets no live draw names any more. Kept so a respawn rebinds them
+/// instead of re-uploading, and evicted oldest-first once they outgrow the
+/// budget. Sized for the churning set -- gore, casings, decals -- not for the
+/// map, whose slots never leave.
+const RETAINED_GPU_BUDGET_BYTES: u64 = 32 << 20;
+
+struct PreparedActor {
+    model_matrix: [[f32; 4]; 4],
+    joint_buffer: metal::Buffer,
+    joint_offset: u64,
+}
+
+enum RetainedAsset {
+    Mesh(AssetId<Mesh>),
+    Texture(AssetId<Image>),
+}
+
+/// Takes an id back out of the retained queue, because a draw names it again.
+fn unretain(
+    retained: &mut std::collections::VecDeque<(RetainedAsset, u64)>,
+    retained_bytes: &mut u64,
+    wanted: &RetainedAsset,
+) {
+    if retained.is_empty() {
+        return;
+    }
+    let same = |held: &RetainedAsset| match (held, wanted) {
+        (RetainedAsset::Mesh(a), RetainedAsset::Mesh(b)) => a == b,
+        (RetainedAsset::Texture(a), RetainedAsset::Texture(b)) => a == b,
+        _ => false,
+    };
+    if let Some(at) = retained.iter().position(|(held, _)| same(held)) {
+        *retained_bytes -= retained[at].1;
+        retained.remove(at);
+    }
+}
+
 fn retain_draw_assets(
     mesh_refs: &mut std::collections::HashMap<AssetId<Mesh>, u32>,
     texture_refs: &mut std::collections::HashMap<AssetId<Image>, u32>,
+    retained: &mut std::collections::VecDeque<(RetainedAsset, u64)>,
+    retained_bytes: &mut u64,
     draw: &RealGameMeshDraw,
 ) {
     *mesh_refs.entry(draw.mesh_id).or_insert(0) += 1;
+    unretain(retained, retained_bytes, &RetainedAsset::Mesh(draw.mesh_id));
     for id in [draw.texture_id, draw.normal_texture_id].into_iter().flatten() {
         *texture_refs.entry(id).or_insert(0) += 1;
+        unretain(retained, retained_bytes, &RetainedAsset::Texture(id));
     }
 }
 
 /// Counts a draw's assets as used by one fewer slot, dropping whatever reaches
 /// nobody.
+/// Drops the draw's claim on its assets. Nothing is freed here: an unclaimed
+/// asset joins the retained queue and only leaves the GPU once that queue is
+/// over budget, so a gore piece respawning after its 20s lifetime rebinds what
+/// is already uploaded.
 fn release_draw_assets(
     mesh_refs: &mut std::collections::HashMap<AssetId<Mesh>, u32>,
     texture_refs: &mut std::collections::HashMap<AssetId<Image>, u32>,
-    geometry: &mut std::collections::HashMap<
+    geometry: &std::collections::HashMap<
         AssetId<Mesh>,
-        (metal::Buffer, metal::Buffer, usize, usize, [f32; 3], f32),
+        (metal::Buffer, metal::Buffer, usize, usize, [f32; 3], f32, bool),
     >,
-    textures: &mut std::collections::HashMap<AssetId<Image>, metal::Texture>,
-    ui_nodes: &[super::snapshot::GenericUiNode],
+    textures: &std::collections::HashMap<AssetId<Image>, metal::Texture>,
+    retained: &mut std::collections::VecDeque<(RetainedAsset, u64)>,
+    retained_bytes: &mut u64,
     draw: RealGameMeshDraw,
 ) {
     if let Some(count) = mesh_refs.get_mut(&draw.mesh_id) {
         *count -= 1;
         if *count == 0 {
             mesh_refs.remove(&draw.mesh_id);
-            geometry.remove(&draw.mesh_id);
+            if let Some((vertices, indices, ..)) = geometry.get(&draw.mesh_id) {
+                let bytes = vertices.length() + indices.length();
+                *retained_bytes += bytes;
+                retained.push_back((RetainedAsset::Mesh(draw.mesh_id), bytes));
+            }
         }
     }
     for id in [draw.texture_id, draw.normal_texture_id].into_iter().flatten() {
@@ -1640,13 +1808,10 @@ fn release_draw_assets(
             continue;
         }
         texture_refs.remove(&id);
-        // A HUD image lives in the same map without any mesh naming it, so no
-        // count ever stands behind it. Checked only here, where a count has
-        // just reached zero, and against a list of tens.
-        let on_screen =
-            ui_nodes.iter().any(|node| node.image.as_ref().is_some_and(|image| image.id == id));
-        if !on_screen {
-            textures.remove(&id);
+        if let Some(texture) = textures.get(&id) {
+            let bytes = texture.allocated_size();
+            *retained_bytes += bytes;
+            retained.push_back((RetainedAsset::Texture(id), bytes));
         }
     }
 }
@@ -1827,6 +1992,15 @@ impl NativeMetalRenderer {
         let unlit_by_shadows = ShaderFeatures { shadows: false, ..features };
         let (sponza_pipeline_no_shadows, sponza_pipeline_no_shadows_no_msaa) =
             build_scene_pipelines(unlit_by_shadows.defines(), false);
+        // desert_city ships no normal maps at all, so without these every one
+        // of its pixels sampled the 1x1 flat fallback and ran the whole
+        // tangent-space reconstruction to arrive back at the geometric normal.
+        let flat_normal = ShaderFeatures { normal_map: false, ..features };
+        let (sponza_pipeline_flat_normal, sponza_pipeline_flat_normal_no_msaa) =
+            build_scene_pipelines(flat_normal.defines(), false);
+        let flat_normal_unlit = ShaderFeatures { shadows: false, normal_map: false, ..features };
+        let (sponza_pipeline_no_shadows_flat_normal, sponza_pipeline_no_shadows_flat_normal_no_msaa) =
+            build_scene_pipelines(flat_normal_unlit.defines(), false);
         // Transparent surfaces are drawn last, over geometry that is already
         // shaded, and cannot reject anything behind them. Shadow lookups,
         // normal mapping and specular are the costliest things in the shader
@@ -2097,6 +2271,10 @@ impl NativeMetalRenderer {
             sponza_blend_pipeline_no_msaa,
             sponza_pipeline_no_shadows,
             sponza_pipeline_no_shadows_no_msaa,
+            sponza_pipeline_flat_normal,
+            sponza_pipeline_flat_normal_no_msaa,
+            sponza_pipeline_no_shadows_flat_normal,
+            sponza_pipeline_no_shadows_flat_normal_no_msaa,
             sponza_sampler,
             shadow_map,
             shadow_map_point,
@@ -2129,11 +2307,16 @@ impl NativeMetalRenderer {
             start_time: std::time::Instant::now(),
 
             real_game_textures: std::collections::HashMap::new(),
+            retained: std::collections::VecDeque::new(),
+            retained_bytes: 0,
             gpu_transformed_mesh_cache: std::collections::HashMap::new(),
             real_game_draws: Vec::new(),
             mesh_refs: std::collections::HashMap::new(),
             texture_refs: std::collections::HashMap::new(),
             blend_slots: std::collections::BTreeSet::new(),
+            opaque_order: Vec::new(),
+            opaque_in_order: Vec::new(),
+            opaque_pending: 0,
             real_game_camera_rotation: [0.0, 0.0, 0.0, 1.0],
             real_game_ads_blend: 0.0,
             real_game_wall_raise: 0.0,
@@ -2221,6 +2404,78 @@ impl NativeMetalRenderer {
         }
     }
 
+    fn opaque_draw_order(draws: &[Option<RealGameMeshDraw>]) -> Vec<usize> {
+        let mut groups: std::collections::HashMap<
+            (Option<AssetId<Image>>, Option<AssetId<Image>>),
+            u32,
+        > = std::collections::HashMap::new();
+        let mut ordered: Vec<((bool, u32), usize)> = Vec::with_capacity(draws.len());
+        for (slot, draw) in draws.iter().enumerate() {
+            let Some(m) = draw.as_ref() else { continue };
+            if m.is_blend {
+                continue;
+            }
+            let next = groups.len() as u32;
+            let group = *groups.entry((m.texture_id, m.normal_texture_id)).or_insert(next);
+            // Normal-map-ness first: it picks the pipeline, and a pipeline
+            // switch costs more than a texture bind.
+            ordered.push(((m.normal_texture_id.is_some(), group), slot));
+        }
+        ordered.sort_unstable();
+        ordered.into_iter().map(|(_, slot)| slot).collect()
+    }
+
+    /// Computed once per actor per frame: the sun shadow, the point shadow and
+    /// the scene pass all draw the same skeletons, and each pushing its own
+    /// copy filled the joint ring three times over.
+    fn prepare_actor(
+        &self,
+        actor: &super::skinned_actor::SkinnedActorDraw,
+    ) -> Option<PreparedActor> {
+        let slot = self.skinned_models.get(actor.model)?;
+        let (model, mesh_scale, y_offset) = (&slot.model, slot.scale, slot.y_offset);
+        let (model_matrix, joint_matrices): (_, std::borrow::Cow<[[[f32; 4]; 4]]>) = match &actor.pose {
+            super::skinned_actor::SkinnedActorPose::JointMatrices(matrices) => {
+                ([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]], std::borrow::Cow::Borrowed(matrices.as_slice()))
+            }
+            super::skinned_actor::SkinnedActorPose::Clip { clip_index, time } => {
+                let rotation = if slot.facing_correction != 0.0 {
+                    actor.transform.rotation * bevy::math::Quat::from_rotation_y(slot.facing_correction)
+                } else {
+                    actor.transform.rotation
+                };
+                let [qx, qy, qz, qw] = rotation.to_array();
+                let (x2, y2, z2) = (qx + qx, qy + qy, qz + qz);
+                let (xx, xy, xz) = (qx * x2, qx * y2, qx * z2);
+                let (yy, yz, zz) = (qy * y2, qy * z2, qz * z2);
+                let (wx, wy, wz) = (qw * x2, qw * y2, qw * z2);
+                let matrix = [
+                    [(1.0 - (yy + zz)) * mesh_scale, (xy + wz) * mesh_scale, (xz - wy) * mesh_scale, 0.0],
+                    [(xy - wz) * mesh_scale, (1.0 - (xx + zz)) * mesh_scale, (yz + wx) * mesh_scale, 0.0],
+                    [(xz + wy) * mesh_scale, (yz - wx) * mesh_scale, (1.0 - (xx + yy)) * mesh_scale, 0.0],
+                    [actor.transform.translation.x, actor.transform.translation.y + y_offset, actor.transform.translation.z, 1.0],
+                ];
+                (matrix, std::borrow::Cow::Owned(model.compute_joint_matrices(*clip_index, *time)))
+            }
+        };
+
+        if joint_matrices.is_empty() {
+            return None;
+        }
+        let (joint_buffer, joint_offset) = match self.joint_ring.push(&joint_matrices) {
+            Some((buffer, offset)) => (buffer.to_owned(), offset),
+            None => (
+                self.device.new_buffer_with_data(
+                    joint_matrices.as_ptr() as *const _,
+                    std::mem::size_of_val(&joint_matrices[..]) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                ),
+                0,
+            ),
+        };
+        Some(PreparedActor { model_matrix, joint_buffer, joint_offset })
+    }
+
     fn draw_scene(
         &self,
         encoder: &metal::RenderCommandEncoderRef,
@@ -2228,6 +2483,7 @@ impl NativeMetalRenderer {
         light: LightUniform,
 
         extracted: &[super::skinned_actor::SkinnedActorDraw],
+        prepared: &[Option<PreparedActor>],
         _now: f32,
         real_game_meshes: Option<&[Option<RealGameMeshDraw>]>,
 
@@ -2247,6 +2503,13 @@ impl NativeMetalRenderer {
             (true, false) => self.sponza_pipeline_no_shadows.as_ref(),
             (false, false) => self.sponza_pipeline_no_shadows_no_msaa.as_ref(),
         };
+        let sponza_pipeline_flat_normal = match (msaa_enabled, shadows_on) {
+            (true, true) => self.sponza_pipeline_flat_normal.as_ref(),
+            (false, true) => self.sponza_pipeline_flat_normal_no_msaa.as_ref(),
+            (true, false) => self.sponza_pipeline_no_shadows_flat_normal.as_ref(),
+            (false, false) => self.sponza_pipeline_no_shadows_flat_normal_no_msaa.as_ref(),
+        }
+        .or(sponza_pipeline);
         let sponza_blend_pipeline = if msaa_enabled {
             self.sponza_blend_pipeline.as_ref()
         } else {
@@ -2257,43 +2520,79 @@ impl NativeMetalRenderer {
         encoder.set_fragment_sampler_state(1, Some(&self.shadow_sampler));
         encoder.set_fragment_texture(2, Some(&self.shadow_map_point));
 
+        let pass_uniforms = SponzaPassUniforms {
+            view_projection,
+            light_pos: light.position,
+            light_range: light.range,
+            light_color: light.color,
+            sun_dir: light.sun_dir,
+            _sun_pad: 0.0,
+            sun_color: light.sun_color,
+            light_view_projection,
+            point_light_view_projection,
+            camera_pos,
+            _camera_pad: 0.0,
+        };
+        // The skinned pass binds its own buffer(1), texture(3) and texture(4)
+        // between the opaque and blended loops, so both sponza loops bind
+        // these rather than the pass setting them once.
+        let bind_sponza_pass_state = || {
+            encoder.set_vertex_bytes(
+                1,
+                std::mem::size_of::<SponzaPassUniforms>() as u64,
+                &pass_uniforms as *const _ as *const _,
+            );
+            encoder.set_fragment_bytes(
+                1,
+                std::mem::size_of::<SponzaPassUniforms>() as u64,
+                &pass_uniforms as *const _ as *const _,
+            );
+            encoder.set_fragment_sampler_state(0, Some(&self.sponza_sampler));
+            encoder.set_fragment_texture(4, Some(self.lightmap.as_deref().unwrap_or(&self.white_texture)));
+        };
+
+        // The most repeated encoder calls in the pass, against a map whose
+        // 2363 primitives share 13 images. Compared by pointer so the
+        // white/flat fallbacks collapse into the same binding as each other.
+        let bound_texture = std::cell::Cell::new(std::ptr::null_mut());
+        let bound_normal_texture = std::cell::Cell::new(std::ptr::null_mut());
+        let forget_bound_textures = || {
+            bound_texture.set(std::ptr::null_mut());
+            bound_normal_texture.set(std::ptr::null_mut());
+        };
+
         let draw_static_mesh = |m: &RealGameMeshDraw| {
-            let sponza_uniforms = SponzaUniforms {
-                view_projection,
-                light_pos: light.position,
-                light_range: light.range,
-                light_color: light.color,
-                sun_dir: light.sun_dir,
-                _sun_pad: 0.0,
-                sun_color: light.sun_color,
+            let mesh_uniforms = SponzaMeshUniforms {
                 base_color_factor: m.base_color_factor,
                 emissive: m.emissive,
-                light_view_projection,
-                point_light_view_projection,
-                camera_pos,
-                _camera_pad: 0.0,
                 model_matrix: m.model_matrix,
                 normal_matrix: normal_matrix_for(m.model_matrix),
             };
             encoder.set_vertex_buffer(0, Some(&m.vertex_buffer), 0);
             encoder.set_vertex_bytes(
-                1,
-                std::mem::size_of::<SponzaUniforms>() as u64,
-                &sponza_uniforms as *const _ as *const _,
+                2,
+                std::mem::size_of::<SponzaMeshUniforms>() as u64,
+                &mesh_uniforms as *const _ as *const _,
             );
             encoder.set_fragment_bytes(
-                1,
-                std::mem::size_of::<SponzaUniforms>() as u64,
-                &sponza_uniforms as *const _ as *const _,
+                2,
+                std::mem::size_of::<SponzaMeshUniforms>() as u64,
+                &mesh_uniforms as *const _ as *const _,
             );
             let texture = m.texture.as_ref().unwrap_or(&self.white_texture);
-            encoder.set_fragment_texture(0, Some(texture));
+            if bound_texture.get() != texture.as_ptr() {
+                encoder.set_fragment_texture(0, Some(texture));
+                bound_texture.set(texture.as_ptr());
+            }
             let normal_texture = m.normal_texture.as_ref().unwrap_or(&self.flat_normal_texture);
-            encoder.set_fragment_texture(3, Some(normal_texture));
+            if bound_normal_texture.get() != normal_texture.as_ptr() {
+                encoder.set_fragment_texture(3, Some(normal_texture));
+                bound_normal_texture.set(normal_texture.as_ptr());
+            }
             encoder.draw_indexed_primitives(
                 MTLPrimitiveType::Triangle,
                 m.index_count as u64,
-                MTLIndexType::UInt32,
+                if m.narrow_index { MTLIndexType::UInt16 } else { MTLIndexType::UInt32 },
                 &m.index_buffer,
                 0,
             );
@@ -2305,19 +2604,26 @@ impl NativeMetalRenderer {
 
         if let Some(meshes) = real_game_meshes {
 
-            encoder.set_render_pipeline_state(sponza_pipeline.unwrap());
-            encoder.set_fragment_sampler_state(0, Some(&self.sponza_sampler));
-            // Bound once for the pass, not per mesh: it is one texture for the
-            // whole map. Falls back to the white texture so the sample is
+            let mut bound_flat_normal: Option<bool> = None;
+            // The lightmap falls back to the white texture so the sample is
             // defined even before the host has handed one over -- the shader
             // skips it on uv2 being zero, but an unbound slot is undefined
             // behaviour rather than a defined white.
-            encoder.set_fragment_texture(4, Some(self.lightmap.as_deref().unwrap_or(&self.white_texture)));
-            for m in meshes
+            bind_sponza_pass_state();
+            // opaque_order, not slot order: it groups the draws by texture so
+            // the binds above it can be skipped.
+            for m in self
+                .opaque_order
                 .iter()
-                .flatten()
+                .filter_map(|slot| meshes.get(*slot).and_then(|m| m.as_ref()))
                 .filter(|m| !m.is_blend && draws_in_view(m, &planes))
             {
+                let flat = m.normal_texture_id.is_none();
+                if bound_flat_normal != Some(flat) {
+                    let picked = if flat { sponza_pipeline_flat_normal } else { sponza_pipeline };
+                    encoder.set_render_pipeline_state(picked.unwrap());
+                    bound_flat_normal = Some(flat);
+                }
                 draw_static_mesh(m);
             }
         }
@@ -2336,80 +2642,63 @@ impl NativeMetalRenderer {
             encoder.set_fragment_sampler_state(2, Some(sampler));
         }
 
-        for actor in extracted {
-            let Some(slot) = self.skinned_models.get(actor.model) else { continue };
-            let (model, mesh_scale, y_offset) = (&slot.model, slot.scale, slot.y_offset);
+        let skinned_pass_uniforms = SkinnedPassUniforms {
+            view_projection,
+            light_pos: light.position,
+            light_range: light.range,
+            light_color: light.color,
+            sun_dir: light.sun_dir,
+            _sun_pad: 0.0,
+            sun_color: light.sun_color,
+            light_view_projection,
+            point_light_view_projection,
+            camera_pos,
+            _camera_pad: 0.0,
+            probe_origin_spacing: self.probe_origin_spacing,
+            probe_dims: self.probe_dims,
+        };
+        encoder.set_vertex_bytes(
+            1,
+            std::mem::size_of::<SkinnedPassUniforms>() as u64,
+            &skinned_pass_uniforms as *const _ as *const _,
+        );
+        encoder.set_fragment_bytes(
+            1,
+            std::mem::size_of::<SkinnedPassUniforms>() as u64,
+            &skinned_pass_uniforms as *const _ as *const _,
+        );
 
-            let (model_matrix, joint_matrices) = match &actor.pose {
-                super::skinned_actor::SkinnedActorPose::JointMatrices(matrices) => {
-                    ([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]], matrices.clone())
-                }
-                super::skinned_actor::SkinnedActorPose::Clip { clip_index, time } => {
-                    let rotation = if slot.facing_correction != 0.0 {
-                        actor.transform.rotation * bevy::math::Quat::from_rotation_y(slot.facing_correction)
-                    } else {
-                        actor.transform.rotation
-                    };
-                    let [qx, qy, qz, qw] = rotation.to_array();
-                    let (x2, y2, z2) = (qx + qx, qy + qy, qz + qz);
-                    let (xx, xy, xz) = (qx * x2, qx * y2, qx * z2);
-                    let (yy, yz, zz) = (qy * y2, qy * z2, qz * z2);
-                    let (wx, wy, wz) = (qw * x2, qw * y2, qw * z2);
-                    let matrix = [
-                        [(1.0 - (yy + zz)) * mesh_scale, (xy + wz) * mesh_scale, (xz - wy) * mesh_scale, 0.0],
-                        [(xy - wz) * mesh_scale, (1.0 - (xx + zz)) * mesh_scale, (yz + wx) * mesh_scale, 0.0],
-                        [(xz + wy) * mesh_scale, (yz - wx) * mesh_scale, (1.0 - (xx + yy)) * mesh_scale, 0.0],
-                        [actor.transform.translation.x, actor.transform.translation.y + y_offset, actor.transform.translation.z, 1.0],
-                    ];
-                    (matrix, model.compute_joint_matrices(*clip_index, *time))
-                }
-            };
-
-            if joint_matrices.is_empty() {
+        for (actor, prepared) in extracted.iter().zip(prepared) {
+            if !actor_in_view(actor, &planes) {
                 continue;
             }
-            let fallback;
-            let (joint_buffer, joint_offset) = match self.joint_ring.push(&joint_matrices) {
-                Some(slot) => slot,
-                None => {
-                    fallback = self.device.new_buffer_with_data(
-                        joint_matrices.as_ptr() as *const _,
-                        std::mem::size_of_val(joint_matrices.as_slice()) as u64,
-                        MTLResourceOptions::StorageModeShared,
-                    );
-                    (fallback.as_ref(), 0)
-                }
+            let (Some(slot), Some(prepared)) =
+                (self.skinned_models.get(actor.model), prepared.as_ref())
+            else {
+                continue;
             };
+            let model = &slot.model;
+            let model_matrix = prepared.model_matrix;
+            let (joint_buffer, joint_offset) =
+                (prepared.joint_buffer.as_ref(), prepared.joint_offset);
+
 
             for mesh in &model.meshes {
-                let skinned_uniforms = SkinnedUniforms {
-                    view_projection,
+                let skinned_mesh_uniforms = SkinnedMeshUniforms {
                     model_matrix,
-                    light_pos: light.position,
-                    light_range: light.range,
-                    light_color: light.color,
-                    sun_dir: light.sun_dir,
-                    _sun_pad: 0.0,
-                    sun_color: light.sun_color,
                     base_color_factor: mesh.base_color_factor,
-                    light_view_projection,
-                    point_light_view_projection,
-                    camera_pos,
-                    _camera_pad: 0.0,
-                    probe_origin_spacing: self.probe_origin_spacing,
-                    probe_dims: self.probe_dims,
                 };
                 encoder.set_vertex_buffer(0, Some(&mesh.vertex_buffer), 0);
                 encoder.set_vertex_buffer(2, Some(joint_buffer), joint_offset);
                 encoder.set_vertex_bytes(
-                    1,
-                    std::mem::size_of::<SkinnedUniforms>() as u64,
-                    &skinned_uniforms as *const _ as *const _,
+                    3,
+                    std::mem::size_of::<SkinnedMeshUniforms>() as u64,
+                    &skinned_mesh_uniforms as *const _ as *const _,
                 );
                 encoder.set_fragment_bytes(
-                    1,
-                    std::mem::size_of::<SkinnedUniforms>() as u64,
-                    &skinned_uniforms as *const _ as *const _,
+                    3,
+                    std::mem::size_of::<SkinnedMeshUniforms>() as u64,
+                    &skinned_mesh_uniforms as *const _ as *const _,
                 );
                 let texture = mesh.base_color_texture.as_ref().unwrap_or(&self.white_texture);
                 encoder.set_fragment_texture(0, Some(texture));
@@ -2448,7 +2737,8 @@ impl NativeMetalRenderer {
             if !blended.is_empty() {
                 encoder.set_depth_stencil_state(&self.blend_depth_state);
                 encoder.set_render_pipeline_state(sponza_blend_pipeline.unwrap_or(sponza_pipeline.unwrap()));
-                encoder.set_fragment_sampler_state(0, Some(&self.sponza_sampler));
+                bind_sponza_pass_state();
+                forget_bound_textures();
                 for m in blended {
                     draw_static_mesh(m);
                 }
@@ -2543,6 +2833,7 @@ impl NativeMetalRenderer {
         encoder: &metal::RenderCommandEncoderRef,
         light_view_projection: [[f32; 4]; 4],
         extracted: &[super::skinned_actor::SkinnedActorDraw],
+        prepared: &[Option<PreparedActor>],
         real_game_meshes: Option<&[Option<RealGameMeshDraw>]>,
     ) {
         if let Some(meshes) = real_game_meshes.filter(|_| self.shadow_static) {
@@ -2561,7 +2852,7 @@ impl NativeMetalRenderer {
                     encoder.draw_indexed_primitives(
                 MTLPrimitiveType::Triangle,
                 m.index_count as u64,
-                MTLIndexType::UInt32,
+                if m.narrow_index { MTLIndexType::UInt16 } else { MTLIndexType::UInt32 },
                 &m.index_buffer,
                 0,
             );
@@ -2574,49 +2865,21 @@ impl NativeMetalRenderer {
         }
         let Some(pipeline) = self.shadow_pipeline_skinned.as_ref() else { return };
         encoder.set_render_pipeline_state(pipeline);
-        for actor in extracted {
-            let Some(slot) = self.skinned_models.get(actor.model) else { continue };
-            let (model, mesh_scale, y_offset) = (&slot.model, slot.scale, slot.y_offset);
-            let (model_matrix, joint_matrices) = match &actor.pose {
-                super::skinned_actor::SkinnedActorPose::JointMatrices(matrices) => {
-                    ([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]], matrices.clone())
-                }
-                super::skinned_actor::SkinnedActorPose::Clip { clip_index, time } => {
-                    let rotation = if slot.facing_correction != 0.0 {
-                        actor.transform.rotation * bevy::math::Quat::from_rotation_y(slot.facing_correction)
-                    } else {
-                        actor.transform.rotation
-                    };
-                    let [qx, qy, qz, qw] = rotation.to_array();
-                    let (x2, y2, z2) = (qx + qx, qy + qy, qz + qz);
-                    let (xx, xy, xz) = (qx * x2, qx * y2, qx * z2);
-                    let (yy, yz, zz) = (qy * y2, qy * z2, qz * z2);
-                    let (wx, wy, wz) = (qw * x2, qw * y2, qw * z2);
-                    let matrix = [
-                        [(1.0 - (yy + zz)) * mesh_scale, (xy + wz) * mesh_scale, (xz - wy) * mesh_scale, 0.0],
-                        [(xy - wz) * mesh_scale, (1.0 - (xx + zz)) * mesh_scale, (yz + wx) * mesh_scale, 0.0],
-                        [(xz + wy) * mesh_scale, (yz - wx) * mesh_scale, (1.0 - (xx + yy)) * mesh_scale, 0.0],
-                        [actor.transform.translation.x, actor.transform.translation.y + y_offset, actor.transform.translation.z, 1.0],
-                    ];
-                    (matrix, model.compute_joint_matrices(*clip_index, *time))
-                }
-            };
-
-            if joint_matrices.is_empty() {
+        // The light's frustum, for the same reason the static casters use it.
+        let planes = frustum_planes(light_view_projection);
+        for (actor, prepared) in extracted.iter().zip(prepared) {
+            if !actor_in_view(actor, &planes) {
                 continue;
             }
-            let fallback;
-            let (joint_buffer, joint_offset) = match self.joint_ring.push(&joint_matrices) {
-                Some(slot) => slot,
-                None => {
-                    fallback = self.device.new_buffer_with_data(
-                        joint_matrices.as_ptr() as *const _,
-                        std::mem::size_of_val(joint_matrices.as_slice()) as u64,
-                        MTLResourceOptions::StorageModeShared,
-                    );
-                    (fallback.as_ref(), 0)
-                }
+            let (Some(slot), Some(prepared)) =
+                (self.skinned_models.get(actor.model), prepared.as_ref())
+            else {
+                continue;
             };
+            let model = &slot.model;
+            let model_matrix = prepared.model_matrix;
+            let (joint_buffer, joint_offset) =
+                (prepared.joint_buffer.as_ref(), prepared.joint_offset);
             for mesh in &model.meshes {
                 let uniforms = SkinnedShadowUniforms { light_view_projection, model_matrix };
                 encoder.set_vertex_buffer(0, Some(&mesh.vertex_buffer), 0);
@@ -2637,6 +2900,11 @@ impl NativeMetalRenderer {
     /// skip re-extracting geometry it already uploaded.
     pub fn has_uploaded_mesh(&self, id: AssetId<Mesh>) -> bool {
         self.gpu_transformed_mesh_cache.contains_key(&id)
+    }
+
+    /// Lets the host skip copying bytes out of an image this already holds.
+    pub fn has_uploaded_texture(&self, id: AssetId<Image>) -> bool {
+        self.real_game_textures.contains_key(&id)
     }
 
     /// Points, not pixels — what a host needs to size its UI camera viewport.
@@ -2702,6 +2970,8 @@ impl NativeMetalRenderer {
                     transform: actor.transform,
                     model: actor.model,
                     pose: super::skinned_actor::SkinnedActorPose::JointMatrices(actor.joint_matrices),
+                    bounds_centre: actor.bounds_centre,
+                    bounds_radius: actor.bounds_radius,
                 }
             }));
         }
@@ -2771,10 +3041,14 @@ impl NativeMetalRenderer {
         // without any mesh slot moving, and gating this on meshes would leave
         // it unuploaded until something else happened to change.
         for image in self.ui_generic_nodes.iter().filter_map(|node| node.image.as_ref()) {
-            if !self.real_game_textures.contains_key(&image.id) {
+            // An empty payload means the host skipped the copy because this was
+            // already uploaded. Drawing untextured for a frame beats uploading
+            // nothing as if it were the image.
+            if !image.rgba.is_empty() && !self.real_game_textures.contains_key(&image.id) {
                 let uploaded = match image.astc {
                     Some(block) => super::metal_texture::upload_astc(
                         &self.device, image.width, image.height, &image.rgba, block,
+                        image.mip_level_count,
                     ),
                     None => super::metal_texture::upload_texture(
                         &self.device, image.width, image.height, &image.rgba,
@@ -2800,8 +3074,8 @@ impl NativeMetalRenderer {
                 if let Some(gone) = self.real_game_draws[*slot].take() {
                     release_draw_assets(
                         &mut self.mesh_refs, &mut self.texture_refs,
-                        &mut self.gpu_transformed_mesh_cache, &mut self.real_game_textures,
-                        &self.ui_generic_nodes, gone,
+                        &self.gpu_transformed_mesh_cache, &self.real_game_textures,
+                        &mut self.retained, &mut self.retained_bytes, gone,
                     );
                 }
                 continue;
@@ -2822,8 +3096,8 @@ impl NativeMetalRenderer {
                         if let Some(gone) = self.real_game_draws[*slot].take() {
                             release_draw_assets(
                                 &mut self.mesh_refs, &mut self.texture_refs,
-                                &mut self.gpu_transformed_mesh_cache, &mut self.real_game_textures,
-                                &self.ui_generic_nodes, gone,
+                                &self.gpu_transformed_mesh_cache, &self.real_game_textures,
+                                &mut self.retained, &mut self.retained_bytes, gone,
                             );
                         }
                         continue;
@@ -2833,27 +3107,41 @@ impl NativeMetalRenderer {
                         (verts.len() * std::mem::size_of::<super::gltf_scene::GltfVertex>()) as u64,
                         MTLResourceOptions::StorageModeShared,
                     );
-                    let index_buffer = self.device.new_buffer_with_data(
-                        indices.as_ptr() as *const _,
-                        (indices.len() * std::mem::size_of::<u32>()) as u64,
-                        MTLResourceOptions::StorageModeShared,
-                    );
+                    // Half the index bandwidth for anything that fits, which
+                    // on this map is every mesh -- the largest is 8233 verts.
+                    let narrow = verts.len() <= u16::MAX as usize + 1;
+                    let index_buffer = if narrow {
+                        let narrowed: Vec<u16> = indices.iter().map(|i| *i as u16).collect();
+                        self.device.new_buffer_with_data(
+                            narrowed.as_ptr() as *const _,
+                            std::mem::size_of_val(narrowed.as_slice()) as u64,
+                            MTLResourceOptions::StorageModeShared,
+                        )
+                    } else {
+                        self.device.new_buffer_with_data(
+                            indices.as_ptr() as *const _,
+                            std::mem::size_of_val(indices.as_slice()) as u64,
+                            MTLResourceOptions::StorageModeShared,
+                        )
+                    };
                     let (centre, radius) = local_bounds(&mesh.positions);
-                    let entry = (buffer, index_buffer, indices.len(), verts.len(), centre, radius);
+                    let entry =
+                        (buffer, index_buffer, indices.len(), verts.len(), centre, radius, narrow);
                     self.gpu_transformed_mesh_cache.insert(mesh.mesh_id, entry.clone());
                     entry
                 }
             };
-            let (vertex_buffer, index_buffer, index_count, unique_vertices, local_centre, local_radius) =
+            let (vertex_buffer, index_buffer, index_count, unique_vertices, local_centre, local_radius, narrow_index) =
                 geometry;
             // After the bake, not before: a mesh that fails to bake builds no
             // draw, so nothing would ever stand behind textures uploaded for it
             // and nothing would ever count them back down.
             for t in [mesh.texture.as_ref(), mesh.normal_texture.as_ref()].into_iter().flatten() {
-                if !self.real_game_textures.contains_key(&t.id) {
+                if !t.rgba.is_empty() && !self.real_game_textures.contains_key(&t.id) {
                     let uploaded = match t.astc {
                         Some(block) => super::metal_texture::upload_astc(
                             &self.device, t.width, t.height, &t.rgba, block,
+                            t.mip_level_count,
                         ),
                         None => super::metal_texture::upload_texture(
                             &self.device, t.width, t.height, &t.rgba,
@@ -2868,6 +3156,7 @@ impl NativeMetalRenderer {
                 vertex_buffer,
                 index_buffer,
                 index_count,
+                narrow_index,
                 unique_vertices,
                 base_color_factor: mesh.base_color,
                 emissive: mesh.emissive,
@@ -2896,16 +3185,73 @@ impl NativeMetalRenderer {
             } else {
                 self.blend_slots.remove(slot);
             }
-            retain_draw_assets(&mut self.mesh_refs, &mut self.texture_refs, &draw);
+            retain_draw_assets(
+                &mut self.mesh_refs, &mut self.texture_refs,
+                &mut self.retained, &mut self.retained_bytes, &draw,
+            );
             if let Some(gone) = self.real_game_draws[*slot].replace(draw) {
                 release_draw_assets(
                     &mut self.mesh_refs, &mut self.texture_refs,
-                    &mut self.gpu_transformed_mesh_cache, &mut self.real_game_textures,
-                    &self.ui_generic_nodes, gone,
+                    &self.gpu_transformed_mesh_cache, &self.real_game_textures,
+                    &mut self.retained, &mut self.retained_bytes, gone,
                 );
             }
         }
 
+        for (slot, _) in &mesh_updates {
+            let slot = *slot;
+            if self.opaque_in_order.len() <= slot {
+                self.opaque_in_order.resize(slot + 1, false);
+            }
+            let opaque = self
+                .real_game_draws
+                .get(slot)
+                .and_then(|m| m.as_ref())
+                .is_some_and(|m| !m.is_blend);
+            if opaque == self.opaque_in_order[slot] {
+                continue;
+            }
+            self.opaque_in_order[slot] = opaque;
+            self.opaque_pending += 1;
+            if opaque {
+                self.opaque_order.push(slot);
+            } else if let Some(at) = self.opaque_order.iter().position(|s| *s == slot) {
+                self.opaque_order.swap_remove(at);
+            }
+        }
+        while self.retained_bytes > RETAINED_GPU_BUDGET_BYTES {
+            let Some((asset, bytes)) = self.retained.pop_front() else { break };
+            self.retained_bytes -= bytes;
+            match asset {
+                RetainedAsset::Mesh(id) => {
+                    self.gpu_transformed_mesh_cache.remove(&id);
+                }
+                RetainedAsset::Texture(id) => {
+                    // A HUD image lives in the same map without any mesh naming
+                    // it, so no count ever stands behind it. Checked here, at
+                    // the one point the texture would actually be freed.
+                    let on_screen = self.ui_generic_nodes.iter().any(|node| {
+                        node.image.as_ref().is_some_and(|image| image.id == id)
+                    });
+                    if !on_screen {
+                        self.real_game_textures.remove(&id);
+                    }
+                }
+            }
+        }
+
+        // Regrouping the whole list costs ~126us at this map's slot count, so
+        // it waits until enough of the tail is out of order to be worth that,
+        // rather than running on every spawned casing.
+        if self.opaque_pending >= 64 {
+            self.opaque_order = Self::opaque_draw_order(&self.real_game_draws);
+            self.opaque_in_order.clear();
+            self.opaque_in_order.resize(self.real_game_draws.len(), false);
+            for slot in &self.opaque_order {
+                self.opaque_in_order[*slot] = true;
+            }
+            self.opaque_pending = 0;
+        }
         let real_game_meshes_opt =
             if self.real_game_draws.is_empty() { None } else { Some(self.real_game_draws.as_slice()) };
         timings.bookkeeping_ms = bookkeeping_start.elapsed().as_secs_f32() * 1000.0;
@@ -2969,6 +3315,8 @@ impl NativeMetalRenderer {
 
 
         let extracted: Vec<super::skinned_actor::SkinnedActorDraw> = real_game_extracted;
+        let prepared: Vec<Option<PreparedActor>> =
+            extracted.iter().map(|actor| self.prepare_actor(actor)).collect();
 
         let sun_dir = {
             let d = bevy::math::Vec3::from_array(light.sun_dir);
@@ -3014,7 +3362,7 @@ impl NativeMetalRenderer {
             shadow_encoder.set_depth_stencil_state(&self.shadow_depth_state);
 
             if self.shadow_quality > 0 {
-                self.draw_shadow_casters(shadow_encoder, light_view_projection, &extracted, real_game_meshes_opt);
+                self.draw_shadow_casters(shadow_encoder, light_view_projection, &extracted, &prepared, real_game_meshes_opt);
             }
             shadow_encoder.end_encoding();
             shadow_command_buffer.commit();
@@ -3040,7 +3388,7 @@ impl NativeMetalRenderer {
             let point_shadow_encoder = point_shadow_command_buffer.new_render_command_encoder(point_shadow_pass_descriptor);
             point_shadow_encoder.set_depth_stencil_state(&self.shadow_depth_state);
             if self.shadow_quality > 0 {
-                self.draw_shadow_casters(point_shadow_encoder, point_light_view_projection, &extracted, real_game_meshes_opt);
+                self.draw_shadow_casters(point_shadow_encoder, point_light_view_projection, &extracted, &prepared, real_game_meshes_opt);
             }
             point_shadow_encoder.end_encoding();
             point_shadow_command_buffer.commit();
@@ -3079,6 +3427,7 @@ impl NativeMetalRenderer {
             view_projection,
             light,
             &extracted,
+            &prepared,
             now,
             real_game_meshes_opt,
             msaa_enabled,
@@ -3097,8 +3446,9 @@ impl NativeMetalRenderer {
                 encoder.set_render_pipeline_state(ui_pipeline);
                 encoder.set_fragment_sampler_state(0, Some(&self.ui_sampler));
 
+                let mut ui = UiEncoder { encoder, bound_texture: 0, scissor: None };
                 draw_generic_ui_nodes(
-                    encoder,
+                    &mut ui,
                     &self.ui_generic_nodes,
                     render_width as f32,
                     render_height as f32,

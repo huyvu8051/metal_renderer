@@ -38,4 +38,7 @@ pub struct SkinnedActorDraw {
     pub transform: Transform,
     pub model: &'static str,
     pub pose: SkinnedActorPose,
+    /// See SkinnedRenderState's own fields: zero radius means never cull.
+    pub bounds_centre: [f32; 3],
+    pub bounds_radius: f32,
 }

@@ -10,14 +10,28 @@ use metal::{Device, MTLResourceOptions};
 #[derive(Copy, Clone)]
 pub struct GltfVertex {
     pub position: [f32; 3],
-    pub normal: [f32; 3],
+    /// snorm16: one part in 32767 of a unit vector, three orders finer than
+    /// the lighting resolves, for a third of the bytes f32x3 took.
+    pub normal: [i16; 4],
     pub uv: [f32; 2],
+    /// xyz the tangent direction as snorm16, w glTF's handedness sign.
+    pub tangent: [i16; 4],
+    /// Lightmap coordinates, already normalised to 0..1 by the baker, as
+    /// unorm16 -- 1/65535 against a 2048-texel atlas. Zero for anything the
+    /// bake did not cover, which the shader reads as "no lightmap here" and
+    /// falls back to the flat ambient term.
+    pub uv2: [u16; 2],
+}
 
-    pub tangent: [f32; 4],
-    /// Lightmap coordinates, already normalised to 0..1 by the baker. Zero for
-    /// anything the bake did not cover, which the shader reads as "no lightmap
-    /// here" and falls back to the flat ambient term.
-    pub uv2: [f32; 2],
+/// A unit vector plus a sign, as the shader reads it back.
+pub fn snorm16(v: [f32; 3], w: f32) -> [i16; 4] {
+    let q = |x: f32| (x.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+    [q(v[0]), q(v[1]), q(v[2]), q(w)]
+}
+
+pub fn unorm16(v: [f32; 2]) -> [u16; 2] {
+    let q = |x: f32| (x.clamp(0.0, 1.0) * 65535.0).round() as u16;
+    [q(v[0]), q(v[1])]
 }
 
 /// The whole map in one vertex buffer and one index buffer, each mesh an
@@ -184,11 +198,11 @@ fn walk_node(
                     GltfVertex {
                         // Skinned and scene glTFs carry no lightmap; only the
                         // map does, and it comes in through the host.
-                        uv2: [0.0, 0.0],
+                        uv2: [0, 0],
                         position: transform_point(world, positions[i]),
-                        normal: transform_direction(world, normals[i]),
+                        normal: snorm16(transform_direction(world, normals[i]), 0.0),
                         uv: uvs[i],
-                        tangent: [tangent[0], tangent[1], tangent[2], tangents[i][3]],
+                        tangent: snorm16(tangent, tangents[i][3]),
                     }
                 })
                 .collect();

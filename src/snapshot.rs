@@ -20,6 +20,9 @@ pub struct ExtractedTexture {
     /// decoding was never the point of compressing them.
     pub rgba: std::sync::Arc<[u8]>,
     pub astc: Option<AstcBlock>,
+    /// Levels present in `rgba`, mip-major, as KTX2 shipped them. One means
+    /// level zero only.
+    pub mip_level_count: u32,
 }
 
 /// The block size, which is all the Metal pixel format needs beyond knowing
@@ -185,6 +188,10 @@ pub struct SkinnedRenderState {
     pub transform: Transform,
     pub joint_matrices: Vec<[[f32; 4]; 4]>,
     pub model: &'static str,
+    /// World-space bounding sphere for the frustum test. A radius of zero
+    /// means the host did not supply one, and the actor is never culled.
+    pub bounds_centre: [f32; 3],
+    pub bounds_radius: f32,
 }
 
 impl Default for CameraSnapshot {

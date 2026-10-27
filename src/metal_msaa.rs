@@ -1,4 +1,9 @@
 
+//! Apple GPUs are tile-based: a target that is cleared at the start of a pass
+//! and never stored or sampled afterwards lives entirely in tile memory and
+//! needs no DRAM behind it. Depth here is Clear + DontCare and the multisample
+//! colour resolves into the scene texture, so all three qualify.
+
 use metal::{Device, MTLPixelFormat};
 
 pub(crate) struct MsaaTargets {
@@ -6,6 +11,16 @@ pub(crate) struct MsaaTargets {
     depth: Option<metal::Texture>,
     depth_no_msaa: Option<metal::Texture>,
     color: Option<metal::Texture>,
+}
+
+/// Memoryless exists only on Apple-family GPUs; an Intel Mac has to keep the
+/// DRAM behind these.
+fn tile_only_storage(device: &Device) -> metal::MTLStorageMode {
+    if device.supports_family(metal::MTLGPUFamily::Apple1) {
+        metal::MTLStorageMode::Memoryless
+    } else {
+        metal::MTLStorageMode::Private
+    }
 }
 
 impl MsaaTargets {
@@ -25,7 +40,7 @@ impl MsaaTargets {
         descriptor.set_width(width);
         descriptor.set_height(height);
         descriptor.set_sample_count(self.sample_count);
-        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor.set_storage_mode(tile_only_storage(device));
         descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
         let tex = device.new_texture(&descriptor);
         self.depth = Some(tex.clone());
@@ -44,7 +59,7 @@ impl MsaaTargets {
         descriptor.set_width(width);
         descriptor.set_height(height);
         descriptor.set_sample_count(self.sample_count);
-        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor.set_storage_mode(tile_only_storage(device));
         descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
         let tex = device.new_texture(&descriptor);
         self.color = Some(tex.clone());
@@ -61,7 +76,7 @@ impl MsaaTargets {
         descriptor.set_pixel_format(MTLPixelFormat::Depth32Float);
         descriptor.set_width(width);
         descriptor.set_height(height);
-        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor.set_storage_mode(tile_only_storage(device));
         descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
         let tex = device.new_texture(&descriptor);
         self.depth_no_msaa = Some(tex.clone());

@@ -197,12 +197,13 @@ fn load_image(
     };
 
     if let Some(ktx) = super::metal_texture::parse_ktx2(bytes) {
-        return Some(super::metal_texture::upload_astc(
+        let levels: Vec<&[u8]> = ktx.levels.iter().map(|r| &bytes[r.clone()]).collect();
+        return Some(super::metal_texture::upload_astc_from_levels(
             device,
             ktx.width,
             ktx.height,
-            &bytes[ktx.level0.clone()],
             ktx.block,
+            &levels,
         ));
     }
 

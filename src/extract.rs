@@ -98,13 +98,26 @@ pub fn decode_texture(
     handle: &Handle<Image>,
     images: &Assets<Image>,
     texture_cache: &mut DecodedTextureCache,
-    used: &mut std::collections::HashSet<AssetId<Image>>,
+    already_uploaded: &impl Fn(AssetId<Image>) -> bool,
 ) -> Option<ExtractedTexture> {
-    used.insert(handle.id());
     if let Some(cached) = texture_cache.0.get(&handle.id()) {
         return Some(cached.clone());
     }
     let image = images.get(handle)?;
+    // The host still holds this one, so every byte copied out below would be
+    // thrown away unread -- the same deal geometry_already_uploaded strikes.
+    // Deliberately not cached: an empty payload stored here would be uploaded
+    // as the texture itself if the host ever did drop it.
+    if already_uploaded(handle.id()) {
+        return Some(ExtractedTexture {
+            id: handle.id(),
+            width: image.texture_descriptor.size.width,
+            height: image.texture_descriptor.size.height,
+            rgba: std::sync::Arc::from([].as_slice()),
+            astc: None,
+            mip_level_count: 1,
+        });
+    }
     let data = image.data.as_ref()?;
     use bevy::render::render_resource::{AstcBlock as B, AstcChannel};
     let mut astc = None;
@@ -156,6 +169,9 @@ pub fn decode_texture(
         height: image.texture_descriptor.size.height,
         rgba,
         astc,
+        // Only the ASTC path hands these over untouched; the conversions above
+        // produce level zero alone and upload_texture builds the rest.
+        mip_level_count: if astc.is_some() { image.texture_descriptor.mip_level_count.max(1) } else { 1 },
     };
     texture_cache.0.insert(handle.id(), extracted.clone());
     Some(extracted)
@@ -174,8 +190,8 @@ pub fn store_extracted_mesh(
     materials: &Assets<StandardMaterial>,
     images: &Assets<Image>,
     texture_cache: &mut DecodedTextureCache,
-    used_texture_ids: &mut std::collections::HashSet<AssetId<Image>>,
     geometry_already_uploaded: &impl Fn(AssetId<Mesh>) -> bool,
+    texture_already_uploaded: &impl Fn(AssetId<Image>) -> bool,
     viewmodel: bool,
     // Runs on the finished mesh before it is cached. The host uses it to
     // attach the map's baked lightmap, which this crate knows nothing about --
@@ -186,7 +202,7 @@ pub fn store_extracted_mesh(
     let previous = slot.and_then(|slot| cache.entries.get(slot));
     let Some((extracted, textures_pending)) = extract_one_mesh(
         mesh3d, material3d, transform, visibility, meshes, materials, images,
-        texture_cache, used_texture_ids, geometry_already_uploaded, previous, viewmodel,
+        texture_cache, geometry_already_uploaded, texture_already_uploaded, previous, viewmodel,
     ) else {
         return;
     };
@@ -233,8 +249,8 @@ pub fn extract_one_mesh(
     materials: &Assets<StandardMaterial>,
     images: &Assets<Image>,
     texture_cache: &mut DecodedTextureCache,
-    used_texture_ids: &mut std::collections::HashSet<AssetId<Image>>,
     geometry_already_uploaded: &impl Fn(AssetId<Mesh>) -> bool,
+    texture_already_uploaded: &impl Fn(AssetId<Image>) -> bool,
     previous: Option<&ExtractedMesh>,
     viewmodel: bool,
 ) -> Option<(ExtractedMesh, bool)> {
@@ -273,13 +289,13 @@ pub fn extract_one_mesh(
     let texture = material
         .base_color_texture
         .as_ref()
-        .and_then(|handle| decode_texture(handle, images, texture_cache, used_texture_ids));
+        .and_then(|handle| decode_texture(handle, images, texture_cache, texture_already_uploaded));
     let normal_texture = has_tangents
         .then(|| {
             material
                 .normal_map_texture
                 .as_ref()
-                .and_then(|handle| decode_texture(handle, images, texture_cache, used_texture_ids))
+                .and_then(|handle| decode_texture(handle, images, texture_cache, texture_already_uploaded))
         })
         .flatten();
 

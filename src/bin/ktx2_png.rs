@@ -53,8 +53,9 @@ fn main() {
         &device,
         ktx.width,
         ktx.height,
-        &bytes[ktx.level0.clone()],
+        &bytes[ktx.levels[0].clone()],
         ktx.block,
+        1,
     );
 
     // Matching the source's colour space on the way out. An sRGB texture
