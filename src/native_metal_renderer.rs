@@ -1726,6 +1726,13 @@ struct RealGameMeshDraw {
 /// map, whose slots never leave.
 const RETAINED_GPU_BUDGET_BYTES: u64 = 32 << 20;
 
+/// Three switches for the parts of the opaque pass whose cost depends on what
+/// is on screen, so a view that stutters can be bisected without a rebuild.
+/// Each one restores the behaviour from before this pass was reordered.
+fn env_off(name: &str) -> bool {
+    std::env::var(name).is_ok()
+}
+
 struct PreparedActor {
     model_matrix: [[f32; 4]; 4],
     joint_buffer: metal::Buffer,
@@ -2554,6 +2561,7 @@ impl NativeMetalRenderer {
         // The most repeated encoder calls in the pass, against a map whose
         // 2363 primitives share 13 images. Compared by pointer so the
         // white/flat fallbacks collapse into the same binding as each other.
+        let no_bind_guard = env_off("NO_TEXTURE_BIND_GUARD");
         let bound_texture = std::cell::Cell::new(std::ptr::null_mut());
         let bound_normal_texture = std::cell::Cell::new(std::ptr::null_mut());
         let forget_bound_textures = || {
@@ -2580,12 +2588,12 @@ impl NativeMetalRenderer {
                 &mesh_uniforms as *const _ as *const _,
             );
             let texture = m.texture.as_ref().unwrap_or(&self.white_texture);
-            if bound_texture.get() != texture.as_ptr() {
+            if no_bind_guard || bound_texture.get() != texture.as_ptr() {
                 encoder.set_fragment_texture(0, Some(texture));
                 bound_texture.set(texture.as_ptr());
             }
             let normal_texture = m.normal_texture.as_ref().unwrap_or(&self.flat_normal_texture);
-            if bound_normal_texture.get() != normal_texture.as_ptr() {
+            if no_bind_guard || bound_normal_texture.get() != normal_texture.as_ptr() {
                 encoder.set_fragment_texture(3, Some(normal_texture));
                 bound_normal_texture.set(normal_texture.as_ptr());
             }
@@ -2605,6 +2613,7 @@ impl NativeMetalRenderer {
         if let Some(meshes) = real_game_meshes {
 
             let mut bound_flat_normal: Option<bool> = None;
+            let no_flat_pipeline = env_off("NO_FLAT_NORMAL_PIPELINE");
             // The lightmap falls back to the white texture so the sample is
             // defined even before the host has handed one over -- the shader
             // skips it on uv2 being zero, but an unbound slot is undefined
@@ -2612,13 +2621,16 @@ impl NativeMetalRenderer {
             bind_sponza_pass_state();
             // opaque_order, not slot order: it groups the draws by texture so
             // the binds above it can be skipped.
-            for m in self
-                .opaque_order
+            let slot_order: Vec<usize> = (0..meshes.len()).collect();
+            let order: &[usize] =
+                if env_off("NO_OPAQUE_SORT") { &slot_order } else { &self.opaque_order };
+            for m in order
                 .iter()
                 .filter_map(|slot| meshes.get(*slot).and_then(|m| m.as_ref()))
                 .filter(|m| !m.is_blend && draws_in_view(m, &planes))
             {
                 let flat = m.normal_texture_id.is_none();
+                let flat = flat && !no_flat_pipeline;
                 if bound_flat_normal != Some(flat) {
                     let picked = if flat { sponza_pipeline_flat_normal } else { sponza_pipeline };
                     encoder.set_render_pipeline_state(picked.unwrap());
