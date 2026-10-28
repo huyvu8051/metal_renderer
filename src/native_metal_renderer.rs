@@ -1961,6 +1961,12 @@ impl NativeMetalRenderer {
         let layer = unsafe { MetalLayer::from_ptr(retained as *mut CAMetalLayer) };
         layer.set_device(&device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        // The scene pass clears to an alpha of 1 and covers the whole drawable,
+        // so there is never anything behind this layer to show through. Said
+        // out loud, the compositor can copy the surface to the display instead
+        // of blending it against what is underneath -- and the compositor is
+        // half the fragment time of a frame on the phone.
+        layer.set_opaque(true);
 
         let bounds: CGRect = msg_send![view, bounds];
         let scale = layer.contents_scale();
