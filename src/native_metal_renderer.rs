@@ -112,24 +112,52 @@ const FALLBACK_LIGHT: LightUniform = LightUniform {
 /// symlink someone had left in target/release and a debug build found nothing
 /// at all. Zombies still spawned -- they were being shot at -- but every
 /// skinned model failed to load and they had no mesh.
+/// Where `assets/` sits, as a directory to join onto.
+///
+/// On iOS that is the app bundle, and NSBundle is the only thing that knows
+/// where that was put. Everywhere else it is whatever Bevy decided, which is
+/// the point: the renderer loads a handful of models itself rather than
+/// through the AssetServer, and the two have to agree about where the assets
+/// are or one of them finds nothing.
+///
+/// They did not agree. A plain executable has no bundle, so resourcePath
+/// handed back the directory the binary sits in -- target/debug -- and every
+/// zombie failed to load on the desktop build with a path nobody recognised.
+/// Asking Bevy is not a workaround for that; it is the fix, because Bevy's
+/// answer is the one the rest of the game is already using.
 pub fn bundle_resource_path() -> Option<String> {
-    if let Ok(root) = std::env::var("BEVY_ASSET_ROOT") {
-        if !root.is_empty() {
-            return Some(root);
+    #[cfg(target_os = "ios")]
+    {
+        // BEVY_ASSET_ROOT first, the same order Bevy itself checks in.
+        if let Ok(root) = std::env::var("BEVY_ASSET_ROOT") {
+            if !root.is_empty() {
+                return Some(root);
+            }
+        }
+        unsafe {
+            let bundle_class = class!(NSBundle);
+            let bundle: *mut Object = msg_send![bundle_class, mainBundle];
+            let path: *mut Object = msg_send![bundle, resourcePath];
+            if path.is_null() {
+                return None;
+            }
+            let utf8: *const std::os::raw::c_char = msg_send![path, UTF8String];
+            if utf8.is_null() {
+                return None;
+            }
+            Some(std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned())
         }
     }
-    unsafe {
-        let bundle_class = class!(NSBundle);
-        let bundle: *mut Object = msg_send![bundle_class, mainBundle];
-        let path: *mut Object = msg_send![bundle, resourcePath];
-        if path.is_null() {
-            return None;
-        }
-        let utf8: *const std::os::raw::c_char = msg_send![path, UTF8String];
-        if utf8.is_null() {
-            return None;
-        }
-        Some(std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned())
+    #[cfg(not(target_os = "ios"))]
+    {
+        // BEVY_ASSET_ROOT, then CARGO_MANIFEST_DIR, then the executable's
+        // own directory -- and it is Bevy's function doing the deciding, so
+        // it cannot drift from what the AssetServer resolved.
+        Some(
+            bevy::asset::io::file::FileAssetReader::get_base_path()
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 }
 
