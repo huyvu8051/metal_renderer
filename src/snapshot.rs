@@ -182,6 +182,10 @@ pub struct LightSnapshot {
 
     pub color: [f32; 3],
     pub range: f32,
+    /// What the game said about this light casting shadows. The renderer used
+    /// to decide that for itself from `range`, which meant it ran a shadow
+    /// pass for a light the game had explicitly marked as casting none.
+    pub casts_shadows: bool,
 }
 
 pub struct SkinnedRenderState {

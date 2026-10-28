@@ -1180,6 +1180,15 @@ pub struct NativeMetalRenderer {
 
 
     real_game_light: LightUniform,
+    /// Whether a real, shadow-casting point light is in the snapshot. Not
+    /// derivable from `real_game_light`: by then FALLBACK_LIGHT has been
+    /// substituted for the absent light, and its range is 4000.
+    real_game_point_shadow: bool,
+    /// Whether `shadow_map_point` currently holds the cleared depth that reads
+    /// back as "lit". The shader samples that texture whenever the point light
+    /// reaches a fragment, so skipping the pass without this would leave it
+    /// sampling whatever the last frame that did run left behind.
+    point_shadow_map_neutral: bool,
 
     ui_pipeline: Option<RenderPipelineState>,
     ui_pipeline_no_msaa: Option<RenderPipelineState>,
@@ -2372,6 +2381,8 @@ impl NativeMetalRenderer {
             probe_sampler: None,
             real_game_fov: std::f32::consts::FRAC_PI_4,
             real_game_light: FALLBACK_LIGHT,
+            real_game_point_shadow: false,
+            point_shadow_map_neutral: false,
             ui_pipeline,
             ui_pipeline_no_msaa,
             ui_sampler,
@@ -2855,6 +2866,8 @@ impl NativeMetalRenderer {
         println!("[config] shadow map {size}px (quality {quality})");
         self.shadow_map = Self::make_shadow_texture(&self.device, size);
         self.shadow_map_point = Self::make_shadow_texture(&self.device, size);
+        // A brand new texture holds nothing the shader may read.
+        self.point_shadow_map_neutral = false;
         self.shadow_quality = quality;
     }
 
@@ -3009,6 +3022,15 @@ impl NativeMetalRenderer {
                 if snapshot.light_quality > 0 { 1.0 } else { 0.0 },
                 snapshot.point_light_quality.min(5) as f32 / 5.0,
             );
+            // A shadow pass is worth running only for a light that is really
+            // there, really casts, and is really visible. Quality 0 multiplies
+            // the point light's colour by zero, so its shadow would fall from
+            // a light contributing nothing.
+            self.real_game_point_shadow = snapshot.point_light_quality > 0
+                && snapshot
+                    .light
+                    .as_ref()
+                    .is_some_and(|l| l.casts_shadows && l.range > 0.0);
             mesh_updates = snapshot.static_mesh_updates;
             mesh_slots = snapshot.static_mesh_slots;
 
@@ -3393,8 +3415,12 @@ impl NativeMetalRenderer {
         // do, left both passes still drawing every mesh in the scene — the
         // texture was smaller but the geometry was not.
         let draw_sun_shadows = self.shadow_quality_requested > 0;
-        // Nothing to cast from if there is no point light in range.
-        let draw_point_shadows = draw_sun_shadows && light.range > 0.0;
+        // `light.range > 0.0` was not the test it looked like. With no point
+        // light in the snapshot, `light` is FALLBACK_LIGHT, whose range is
+        // 4000 -- so this was true on every frame of a map that has no point
+        // lights at all, and the pass drew the whole scene into a depth map
+        // for a light that does not exist. Ask the snapshot instead.
+        let draw_point_shadows = draw_sun_shadows && self.real_game_point_shadow;
 
         if draw_sun_shadows {
             let shadow_pass_descriptor = RenderPassDescriptor::new();
@@ -3420,7 +3446,11 @@ impl NativeMetalRenderer {
         let point_to_center = (bevy::math::Vec3::from_array(shadow_center) - bevy::math::Vec3::from_array(point_light_pos)).normalize_or_zero();
         let point_up = if point_to_center.y.abs() > 0.99 { [0.0, 0.0, 1.0] } else { [0.0, 1.0, 0.0] };
         let point_light_view = look_at(point_light_pos, shadow_center, point_up);
-        let point_light_proj = perspective(90.0_f32.to_radians(), 1.0, 0.1, light.range.max(SHADOW_DISTANCE * 2.0));
+        // The far plane is the light's reach. Taking the max with the sun's
+        // shadow distance pushed it to 80 for a muzzle flash that lights 3.2
+        // units, which both kept every caster within 80 units in the frustum
+        // and spread the depth range over 25x the distance that matters.
+        let point_light_proj = perspective(90.0_f32.to_radians(), 1.0, 0.1, light.range.max(1.0));
         let point_light_view_projection = mat_mul(point_light_proj, point_light_view);
 
         if draw_point_shadows {
@@ -3440,6 +3470,22 @@ impl NativeMetalRenderer {
             point_shadow_encoder.end_encoding();
             point_shadow_command_buffer.commit();
             self.last_command_buffers.push(("point shadow", point_shadow_command_buffer.to_owned()));
+            self.point_shadow_map_neutral = false;
+        } else if !self.point_shadow_map_neutral {
+            // Clear alone, no casters: depth 1.0 compares as "nearer than
+            // anything", so every lookup returns lit. Once per transition out
+            // of casting, not once per frame.
+            let neutral_descriptor = RenderPassDescriptor::new();
+            let neutral_depth = neutral_descriptor.depth_attachment().unwrap();
+            neutral_depth.set_texture(Some(&self.shadow_map_point));
+            neutral_depth.set_load_action(MTLLoadAction::Clear);
+            neutral_depth.set_store_action(MTLStoreAction::Store);
+            neutral_depth.set_clear_depth(1.0);
+            let neutral_command_buffer = self.queue.new_command_buffer();
+            let neutral_encoder = neutral_command_buffer.new_render_command_encoder(neutral_descriptor);
+            neutral_encoder.end_encoding();
+            neutral_command_buffer.commit();
+            self.point_shadow_map_neutral = true;
         }
 
 
