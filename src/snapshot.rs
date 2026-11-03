@@ -62,6 +62,14 @@ pub struct ExtractedMesh {
     /// view and the gun is not part of that world: drawn there it appears
     /// inside its own eyepiece.
     pub viewmodel: bool,
+    /// The sight's mark, which rides the eye like the weapon but is not part
+    /// of it.
+    ///
+    /// Clipped to the opening rather than masked by it -- the opposite of
+    /// everything else on the weapon's layer. It belongs to the picture, so
+    /// it shows inside the circle and is cut outside, where a real one would
+    /// be behind the tube wall.
+    pub reticle: bool,
 
     pub is_blend: bool,
     pub mesh_id: AssetId<Mesh>,

@@ -1144,6 +1144,7 @@ pub struct NativeMetalRenderer {
     /// could have been told. Ordered, so the pass still reaches them in slot
     /// order before sorting them back to front.
     blend_slots: std::collections::BTreeSet<usize>,
+    reticle_depth_state: metal::DepthStencilState,
     /// This frame's eyepiece disc, straight off the snapshot.
     scope_window: Option<super::snapshot::ScopeWindow>,
     /// Writes depth and no colour, so the disc stamps a hole for the tube to
@@ -1733,6 +1734,8 @@ struct RealGameMeshDraw {
     /// Skipped by the scope pass: the gun is not part of the world the scope
     /// is looking at, and drawn there it shows up inside its own eyepiece.
     viewmodel: bool,
+    /// The sight's mark. See `ExtractedMesh::reticle`.
+    reticle: bool,
     vertex_buffer: metal::Buffer,
     index_buffer: metal::Buffer,
     index_count: usize,
@@ -1987,6 +1990,17 @@ impl NativeMetalRenderer {
         depth_descriptor.set_depth_compare_function(metal::MTLCompareFunction::Less);
         depth_descriptor.set_depth_write_enabled(true);
         let depth_state = device.new_depth_stencil_state(&depth_descriptor);
+
+        // The mark is clipped to the opening instead of masked by it. Drawn
+        // straight after the disc, `Greater` passes exactly where something
+        // nearer is already stored -- inside the circle that is the disc, at
+        // the eyepiece; outside it is the world, which is further away than
+        // the mark, so the mark is cut. No write, so the weapon drawn after
+        // still tests against the disc rather than the mark.
+        let reticle_depth_descriptor = metal::DepthStencilDescriptor::new();
+        reticle_depth_descriptor.set_depth_compare_function(metal::MTLCompareFunction::Greater);
+        reticle_depth_descriptor.set_depth_write_enabled(false);
+        let reticle_depth_state = device.new_depth_stencil_state(&reticle_depth_descriptor);
 
         let blend_depth_descriptor = metal::DepthStencilDescriptor::new();
         blend_depth_descriptor.set_depth_compare_function(metal::MTLCompareFunction::Less);
@@ -2404,6 +2418,7 @@ impl NativeMetalRenderer {
             mesh_refs: std::collections::HashMap::new(),
             texture_refs: std::collections::HashMap::new(),
             blend_slots: std::collections::BTreeSet::new(),
+            reticle_depth_state,
             scope_window: None,
             disc_pipeline,
             disc_pipeline_no_msaa,
@@ -2597,6 +2612,7 @@ impl NativeMetalRenderer {
         let mut late: Vec<&RealGameMeshDraw> = Vec::new();
         let mut late_actors: Vec<(&super::skinned_actor::SkinnedActorDraw, &PreparedActor)> =
             Vec::new();
+        let mut marks: Vec<&RealGameMeshDraw> = Vec::new();
         let masked_by_scope = self.scope_window.is_some();
         let shadows_on = self.shadow_quality_requested > 0;
         let sponza_pipeline = match (msaa_enabled, shadows_on) {
@@ -2732,6 +2748,10 @@ impl NativeMetalRenderer {
                 .filter_map(|slot| meshes.get(*slot).and_then(|m| m.as_ref()))
                 .filter(|m| !m.is_blend && draws_in_view(m, &planes))
             {
+                if masked_by_scope && m.reticle {
+                    marks.push(m);
+                    continue;
+                }
                 if masked_by_scope && m.viewmodel {
                     late.push(m);
                     continue;
@@ -2881,8 +2901,20 @@ impl NativeMetalRenderer {
             // and the world drawn above it is what stays on screen. Outside
             // the circle it draws as it always did, which is what keeps the
             // tube solid when the sight is looked at rather than through.
-            if !late.is_empty() {
+            if !late.is_empty() || !marks.is_empty() {
                 self.stamp_scope_disc(encoder, view_projection, msaa_enabled);
+
+                // Before the weapon, so what is stored outside the circle is
+                // still the world rather than the tube.
+                if !marks.is_empty() {
+                    encoder.set_depth_stencil_state(&self.reticle_depth_state);
+                    bind_sponza_pass_state();
+                    forget_bound_textures();
+                    encoder.set_render_pipeline_state(sponza_pipeline.unwrap());
+                    for m in &marks {
+                        draw_static_mesh(m);
+                    }
+                }
                 encoder.set_depth_stencil_state(&self.depth_state);
                 bind_sponza_pass_state();
                 forget_bound_textures();
@@ -3395,6 +3427,7 @@ impl NativeMetalRenderer {
             }
             let draw = RealGameMeshDraw {
                 viewmodel: mesh.viewmodel,
+                reticle: mesh.reticle,
                 vertex_buffer,
                 index_buffer,
                 index_count,
