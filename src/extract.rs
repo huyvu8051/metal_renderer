@@ -196,7 +196,9 @@ pub fn store_extracted_mesh(
     // Runs on the finished mesh before it is cached. The host uses it to
     // attach the map's baked lightmap, which this crate knows nothing about --
     // it is not in the glTF and not in any Bevy component.
-    decorate: &impl Fn(&mut ExtractedMesh),
+    // Takes the entity too: the lightmap it attaches needs the geometry,
+    // `through_scope` needs to know which entity this is.
+    decorate: &impl Fn(bevy::ecs::entity::Entity, &mut ExtractedMesh),
 ) {
     let slot = cache.slot_of.get(&entity).copied();
     let previous = slot.and_then(|slot| cache.entries.get(slot));
@@ -207,7 +209,7 @@ pub fn store_extracted_mesh(
         return;
     };
     let mut extracted = extracted;
-    decorate(&mut extracted);
+    decorate(entity, &mut extracted);
     if textures_pending {
         cache.awaiting_textures.insert(entity);
     } else {
@@ -330,6 +332,10 @@ pub fn extract_one_mesh(
             material.alpha_mode,
             AlphaMode::Blend | AlphaMode::Premultiplied | AlphaMode::Add | AlphaMode::Multiply
         ),
+        // The host decides this one in `decorate`: which node is a sight's
+        // far half is a fact about the weapon, which this crate knows
+        // nothing about.
+        through_scope: false,
         mesh_id,
     }, textures_pending))
 }

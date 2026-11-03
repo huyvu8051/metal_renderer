@@ -1144,6 +1144,17 @@ pub struct NativeMetalRenderer {
     /// could have been told. Ordered, so the pass still reaches them in slot
     /// order before sorting them back to front.
     blend_slots: std::collections::BTreeSet<usize>,
+    /// Slots whose draw is the far half of a sight. Same shape as
+    /// `blend_slots`, and for the same reason: a handful of slots out of
+    /// thousands, and walking the list to find them is the cost the list
+    /// exists to avoid.
+    through_slots: std::collections::BTreeSet<usize>,
+    /// This frame's eyepiece disc, straight off the snapshot.
+    scope_window: Option<super::snapshot::ScopeWindow>,
+    /// Writes depth and no colour, so the disc stamps a hole for the tube to
+    /// fail against without painting anything.
+    disc_pipeline: Option<metal::RenderPipelineState>,
+    disc_pipeline_no_msaa: Option<metal::RenderPipelineState>,
     /// Opaque slots in draw order, grouped by texture pair. The pass itself
     /// never sorts, and a spawning casing only appends.
     opaque_order: Vec<usize>,
@@ -1727,6 +1738,9 @@ struct RealGameMeshDraw {
     /// Skipped by the scope pass: the gun is not part of the world the scope
     /// is looking at, and drawn there it shows up inside its own eyepiece.
     viewmodel: bool,
+    /// Held back until the world is drawn, then drawn against the depth disc
+    /// at the eyepiece. See `ExtractedMesh::through_scope`.
+    through_scope: bool,
     vertex_buffer: metal::Buffer,
     index_buffer: metal::Buffer,
     index_count: usize,
@@ -2233,6 +2247,33 @@ impl NativeMetalRenderer {
 
 
 
+        // The eyepiece disc. Same shader as the lines -- it only needs a
+        // position and a view-projection -- but with the colour mask off, so
+        // all it leaves behind is depth.
+        let (disc_pipeline, disc_pipeline_no_msaa) =
+            match device.new_library_with_source(LINE_SHADER_SOURCE, &compile_options) {
+                Ok(library) => {
+                    let vertex_fn = library.get_function("line_vertex", None).unwrap();
+                    let fragment_fn = library.get_function("line_fragment", None).unwrap();
+                    let build = |sample_count: u64| {
+                        let descriptor = build_quad_descriptor(&vertex_fn, &fragment_fn, sample_count);
+                        descriptor.set_depth_attachment_pixel_format(MTLPixelFormat::Depth32Float);
+                        let colour = descriptor.color_attachments().object_at(0).unwrap();
+                        colour.set_blending_enabled(false);
+                        colour.set_write_mask(metal::MTLColorWriteMask::empty());
+                        descriptor
+                    };
+                    (
+                        device.new_render_pipeline_state(&build(MSAA_SAMPLE_COUNT)).ok(),
+                        device.new_render_pipeline_state(&build(1)).ok(),
+                    )
+                }
+                Err(err) => {
+                    eprintln!("[native_metal_renderer] disc shader compile failed: {err}");
+                    (None, None)
+                }
+            };
+
         let blit_pipeline = match device.new_library_with_source(BLIT_SHADER_SOURCE, &compile_options) {
             Ok(library) => {
                 let vertex_fn = library.get_function("blit_vertex", None).unwrap();
@@ -2371,6 +2412,10 @@ impl NativeMetalRenderer {
             mesh_refs: std::collections::HashMap::new(),
             texture_refs: std::collections::HashMap::new(),
             blend_slots: std::collections::BTreeSet::new(),
+            through_slots: std::collections::BTreeSet::new(),
+            scope_window: None,
+            disc_pipeline,
+            disc_pipeline_no_msaa,
             opaque_order: Vec::new(),
             opaque_in_order: Vec::new(),
             opaque_pending: 0,
@@ -2679,7 +2724,7 @@ impl NativeMetalRenderer {
             for m in order
                 .iter()
                 .filter_map(|slot| meshes.get(*slot).and_then(|m| m.as_ref()))
-                .filter(|m| !m.is_blend && draws_in_view(m, &planes))
+                .filter(|m| !m.is_blend && !m.through_scope && draws_in_view(m, &planes))
             {
                 let flat = m.normal_texture_id.is_none();
                 let flat = flat && !no_flat_pipeline;
@@ -2809,9 +2854,91 @@ impl NativeMetalRenderer {
 
                 encoder.set_depth_stencil_state(&self.depth_state);
             }
+
+            // The far half of a fitted sight, last of everything in the
+            // world. The disc goes down first and writes only depth, so
+            // inside the circle of the eyepiece this geometry loses the test
+            // and the world drawn above it is what stays on screen. Outside
+            // the circle it draws as it always did, which is what keeps the
+            // tube solid when the sight is looked at rather than through.
+            let through: Vec<&RealGameMeshDraw> = self
+                .through_slots
+                .iter()
+                .filter_map(|slot| meshes.get(*slot).and_then(|m| m.as_ref()))
+                .filter(|m| draws_in_view(m, &planes))
+                .collect();
+            if !through.is_empty() {
+                self.stamp_scope_disc(encoder, view_projection, msaa_enabled);
+                encoder.set_depth_stencil_state(&self.depth_state);
+                bind_sponza_pass_state();
+                forget_bound_textures();
+                let no_flat = env_off("NO_FLAT_NORMAL_PIPELINE");
+                let mut bound: Option<bool> = None;
+                for m in through {
+                    let flat = m.normal_texture_id.is_none() && !no_flat;
+                    if bound != Some(flat) {
+                        let picked = if flat { sponza_pipeline_flat_normal } else { sponza_pipeline };
+                        encoder.set_render_pipeline_state(picked.unwrap());
+                        bound = Some(flat);
+                    }
+                    draw_static_mesh(m);
+                }
+            }
         }
 
         self.draw_debug_lines(encoder, view_projection, msaa_enabled);
+    }
+
+    /// Stamps the eyepiece opening into the depth buffer, colour untouched.
+    ///
+    /// A fan of triangles rather than a quad: the opening is round, and a
+    /// square hole would cut the corners off the picture. Thirty-two sides is
+    /// under a pixel of error at the size this ever covers on screen.
+    fn stamp_scope_disc(
+        &self,
+        encoder: &metal::RenderCommandEncoderRef,
+        view_projection: [[f32; 4]; 4],
+        msaa_enabled: bool,
+    ) {
+        let Some(window) = self.scope_window.as_ref() else { return };
+        let pipeline = if msaa_enabled { &self.disc_pipeline } else { &self.disc_pipeline_no_msaa };
+        let Some(pipeline) = pipeline else { return };
+
+        let centre = bevy::math::Vec3::from_array(window.centre);
+        let forward = bevy::math::Vec3::from_array(window.forward).normalize_or_zero();
+        if forward == bevy::math::Vec3::ZERO {
+            return;
+        }
+        // Any two axes across the bore will do -- the disc is round, so where
+        // its first vertex lands does not matter.
+        let across = if forward.x.abs() < 0.9 { bevy::math::Vec3::X } else { bevy::math::Vec3::Y };
+        let u = forward.cross(across).normalize() * window.radius;
+        let v = forward.cross(u).normalize() * window.radius;
+
+        const SIDES: usize = 32;
+        let mut verts: Vec<LineVertex> = Vec::with_capacity(SIDES * 3);
+        let rim = |i: usize| {
+            let a = i as f32 / SIDES as f32 * std::f32::consts::TAU;
+            (centre + u * a.cos() + v * a.sin()).to_array()
+        };
+        for i in 0..SIDES {
+            verts.push(LineVertex { position: centre.to_array(), color: [0.0; 4] });
+            verts.push(LineVertex { position: rim(i), color: [0.0; 4] });
+            verts.push(LineVertex { position: rim((i + 1) % SIDES), color: [0.0; 4] });
+        }
+        let buffer = self.device.new_buffer_with_data(
+            verts.as_ptr() as *const _,
+            (verts.len() * std::mem::size_of::<LineVertex>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let uniforms = LineUniforms { view_projection };
+
+        encoder.set_render_pipeline_state(pipeline);
+        encoder.set_depth_stencil_state(&self.depth_state);
+        encoder.set_cull_mode(metal::MTLCullMode::None);
+        encoder.set_vertex_buffer(0, Some(&buffer), 0);
+        encoder.set_vertex_bytes(1, std::mem::size_of::<LineUniforms>() as u64, &uniforms as *const _ as *const _);
+        encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, verts.len() as u64);
     }
 
     fn draw_debug_lines(
@@ -3000,6 +3127,7 @@ impl NativeMetalRenderer {
         {
             self.ui_generic_nodes = snapshot.generic_ui_nodes;
             self.debug_lines = snapshot.debug_lines;
+            self.scope_window = snapshot.scope_window;
             self.msaa_enabled = snapshot.map_msaa_on;
             self.ensure_shadow_map_size(snapshot.shadow_quality);
             self.shadow_quality_requested = snapshot.shadow_quality;
@@ -3228,6 +3356,7 @@ impl NativeMetalRenderer {
             }
             let draw = RealGameMeshDraw {
                 viewmodel: mesh.viewmodel,
+                through_scope: mesh.through_scope,
                 vertex_buffer,
                 index_buffer,
                 index_count,
@@ -3259,6 +3388,11 @@ impl NativeMetalRenderer {
                 self.blend_slots.insert(*slot);
             } else {
                 self.blend_slots.remove(slot);
+            }
+            if draw.through_scope {
+                self.through_slots.insert(*slot);
+            } else {
+                self.through_slots.remove(slot);
             }
             retain_draw_assets(
                 &mut self.mesh_refs, &mut self.texture_refs,

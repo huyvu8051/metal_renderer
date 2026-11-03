@@ -64,8 +64,34 @@ pub struct ExtractedMesh {
     pub viewmodel: bool,
 
     pub is_blend: bool,
+    /// Part of a sight that sits in front of the glass, and so is drawn after
+    /// the world rather than with it. See [`ScopeWindow`].
+    pub through_scope: bool,
 
     pub mesh_id: AssetId<Mesh>,
+}
+
+/// The opening the eye looks through, as a disc in world space.
+///
+/// Stamped into the depth buffer once the world is drawn, with no colour.
+/// The meshes flagged `through_scope` are held back until then and drawn
+/// after it, so inside this circle they lose the depth test and the world
+/// already in the buffer is what stays. Outside it they draw as they always
+/// did, which is what keeps the tube solid when it is looked at rather than
+/// through.
+///
+/// One extra draw of thirty-two triangles, against a second camera's worth of
+/// pass. And it needs no "is the player aiming" test: the disc is real
+/// geometry, so a line of sight that goes through the opening sees the world
+/// and one that does not sees tube.
+///
+/// Sent by the host from the fitted sight's own eye socket, because only the
+/// host knows which sight is on the weapon and where its glass sits.
+pub struct ScopeWindow {
+    pub centre: [f32; 3],
+    /// Down the bore, pointing away from the eye.
+    pub forward: [f32; 3],
+    pub radius: f32,
 }
 
 pub struct CameraSnapshot {
@@ -102,6 +128,8 @@ pub struct ScopeCameraSnapshot {
 pub struct RenderSnapshot {
     pub camera: Option<CameraSnapshot>,
     pub scope_camera: Option<ScopeCameraSnapshot>,
+    /// Where the depth disc goes, if a sight with a tube is fitted.
+    pub scope_window: Option<ScopeWindow>,
     pub skinned_actors: Vec<SkinnedRenderState>,
     /// Only the slots whose mesh actually changed, each paired with its index
     /// into the renderer's persistent draw list. A map that does not move
