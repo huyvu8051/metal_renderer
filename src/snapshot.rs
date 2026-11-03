@@ -64,21 +64,21 @@ pub struct ExtractedMesh {
     pub viewmodel: bool,
 
     pub is_blend: bool,
-    /// Part of a sight that sits in front of the glass, and so is drawn after
-    /// the world rather than with it. See [`ScopeWindow`].
-    pub through_scope: bool,
-
     pub mesh_id: AssetId<Mesh>,
 }
 
 /// The opening the eye looks through, as a disc in world space.
 ///
 /// Stamped into the depth buffer once the world is drawn, with no colour.
-/// The meshes flagged `through_scope` are held back until then and drawn
-/// after it, so inside this circle they lose the depth test and the world
-/// already in the buffer is what stays. Outside it they draw as they always
-/// did, which is what keeps the tube solid when it is looked at rather than
-/// through.
+/// Everything on the weapon's layer is held back until then and drawn after
+/// it, so inside this circle the gun, the arms and the sight all lose the
+/// depth test and the world already in the buffer is what stays. Outside it
+/// they draw as they always did, which keeps the sight solid when it is
+/// looked at rather than through.
+///
+/// Which is why the disc belongs at the glass and not at the rear mouth of
+/// the tube: everything in front of it is what the circle takes, and a disc
+/// left at the mouth takes the eyepiece housing with it.
 ///
 /// One extra draw of thirty-two triangles, against a second camera's worth of
 /// pass. And it needs no "is the player aiming" test: the disc is real

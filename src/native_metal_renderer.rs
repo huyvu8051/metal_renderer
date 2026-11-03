@@ -1144,11 +1144,6 @@ pub struct NativeMetalRenderer {
     /// could have been told. Ordered, so the pass still reaches them in slot
     /// order before sorting them back to front.
     blend_slots: std::collections::BTreeSet<usize>,
-    /// Slots whose draw is the far half of a sight. Same shape as
-    /// `blend_slots`, and for the same reason: a handful of slots out of
-    /// thousands, and walking the list to find them is the cost the list
-    /// exists to avoid.
-    through_slots: std::collections::BTreeSet<usize>,
     /// This frame's eyepiece disc, straight off the snapshot.
     scope_window: Option<super::snapshot::ScopeWindow>,
     /// Writes depth and no colour, so the disc stamps a hole for the tube to
@@ -1738,9 +1733,6 @@ struct RealGameMeshDraw {
     /// Skipped by the scope pass: the gun is not part of the world the scope
     /// is looking at, and drawn there it shows up inside its own eyepiece.
     viewmodel: bool,
-    /// Held back until the world is drawn, then drawn against the depth disc
-    /// at the eyepiece. See `ExtractedMesh::through_scope`.
-    through_scope: bool,
     vertex_buffer: metal::Buffer,
     index_buffer: metal::Buffer,
     index_count: usize,
@@ -2412,7 +2404,6 @@ impl NativeMetalRenderer {
             mesh_refs: std::collections::HashMap::new(),
             texture_refs: std::collections::HashMap::new(),
             blend_slots: std::collections::BTreeSet::new(),
-            through_slots: std::collections::BTreeSet::new(),
             scope_window: None,
             disc_pipeline,
             disc_pipeline_no_msaa,
@@ -2600,6 +2591,10 @@ impl NativeMetalRenderer {
         // reticle out. Both are render layers the windowed build has and the
         // snapshot had no way to express until now.
     ) {
+        // Set aside by the opaque walk and drawn once the world is down.
+        // Out here because the walk and the late draw are two separate
+        // borrows of the mesh list.
+        let mut late: Vec<&RealGameMeshDraw> = Vec::new();
         let shadows_on = self.shadow_quality_requested > 0;
         let sponza_pipeline = match (msaa_enabled, shadows_on) {
             (true, true) => self.sponza_pipeline.as_ref(),
@@ -2721,11 +2716,24 @@ impl NativeMetalRenderer {
             let slot_order: Vec<usize> = (0..meshes.len()).collect();
             let order: &[usize] =
                 if env_off("NO_OPAQUE_SORT") { &slot_order } else { &self.opaque_order };
+            // The whole weapon layer waits while a sight with a tube is
+            // fitted: the gun, what is clamped to it, the arms and the sight
+            // itself. All of it stands between the eye and the picture.
+            //
+            // Decided here and not carried on the draw. Extraction is
+            // incremental, and fitting a sight changes none of these meshes
+            // -- a flag written then would still say "draw me early" on
+            // every one of them.
+            let masked_by_scope = self.scope_window.is_some();
             for m in order
                 .iter()
                 .filter_map(|slot| meshes.get(*slot).and_then(|m| m.as_ref()))
-                .filter(|m| !m.is_blend && !m.through_scope && draws_in_view(m, &planes))
+                .filter(|m| !m.is_blend && draws_in_view(m, &planes))
             {
+                if masked_by_scope && m.viewmodel {
+                    late.push(m);
+                    continue;
+                }
                 let flat = m.normal_texture_id.is_none();
                 let flat = flat && !no_flat_pipeline;
                 if bound_flat_normal != Some(flat) {
@@ -2861,20 +2869,14 @@ impl NativeMetalRenderer {
             // and the world drawn above it is what stays on screen. Outside
             // the circle it draws as it always did, which is what keeps the
             // tube solid when the sight is looked at rather than through.
-            let through: Vec<&RealGameMeshDraw> = self
-                .through_slots
-                .iter()
-                .filter_map(|slot| meshes.get(*slot).and_then(|m| m.as_ref()))
-                .filter(|m| draws_in_view(m, &planes))
-                .collect();
-            if !through.is_empty() {
+            if !late.is_empty() {
                 self.stamp_scope_disc(encoder, view_projection, msaa_enabled);
                 encoder.set_depth_stencil_state(&self.depth_state);
                 bind_sponza_pass_state();
                 forget_bound_textures();
                 let no_flat = env_off("NO_FLAT_NORMAL_PIPELINE");
                 let mut bound: Option<bool> = None;
-                for m in through {
+                for m in late {
                     let flat = m.normal_texture_id.is_none() && !no_flat;
                     if bound != Some(flat) {
                         let picked = if flat { sponza_pipeline_flat_normal } else { sponza_pipeline };
@@ -3356,7 +3358,6 @@ impl NativeMetalRenderer {
             }
             let draw = RealGameMeshDraw {
                 viewmodel: mesh.viewmodel,
-                through_scope: mesh.through_scope,
                 vertex_buffer,
                 index_buffer,
                 index_count,
@@ -3388,11 +3389,6 @@ impl NativeMetalRenderer {
                 self.blend_slots.insert(*slot);
             } else {
                 self.blend_slots.remove(slot);
-            }
-            if draw.through_scope {
-                self.through_slots.insert(*slot);
-            } else {
-                self.through_slots.remove(slot);
             }
             retain_draw_assets(
                 &mut self.mesh_refs, &mut self.texture_refs,
