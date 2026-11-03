@@ -41,4 +41,5 @@ pub struct SkinnedActorDraw {
     /// See SkinnedRenderState's own fields: zero radius means never cull.
     pub bounds_centre: [f32; 3],
     pub bounds_radius: f32,
+    pub viewmodel: bool,
 }

@@ -2591,10 +2591,13 @@ impl NativeMetalRenderer {
         // reticle out. Both are render layers the windowed build has and the
         // snapshot had no way to express until now.
     ) {
-        // Set aside by the opaque walk and drawn once the world is down.
-        // Out here because the walk and the late draw are two separate
-        // borrows of the mesh list.
+        // Set aside by the opaque walk and the skinned pass, drawn once the
+        // world is down. Out here because setting aside and drawing are two
+        // separate borrows of the lists they come from.
         let mut late: Vec<&RealGameMeshDraw> = Vec::new();
+        let mut late_actors: Vec<(&super::skinned_actor::SkinnedActorDraw, &PreparedActor)> =
+            Vec::new();
+        let masked_by_scope = self.scope_window.is_some();
         let shadows_on = self.shadow_quality_requested > 0;
         let sponza_pipeline = match (msaa_enabled, shadows_on) {
             (true, true) => self.sponza_pipeline.as_ref(),
@@ -2724,7 +2727,6 @@ impl NativeMetalRenderer {
             // incremental, and fitting a sight changes none of these meshes
             // -- a flag written then would still say "draw me early" on
             // every one of them.
-            let masked_by_scope = self.scope_window.is_some();
             for m in order
                 .iter()
                 .filter_map(|slot| meshes.get(*slot).and_then(|m| m.as_ref()))
@@ -2785,15 +2787,13 @@ impl NativeMetalRenderer {
             &skinned_pass_uniforms as *const _ as *const _,
         );
 
-        for (actor, prepared) in extracted.iter().zip(prepared) {
-            if !actor_in_view(actor, &planes) {
-                continue;
-            }
-            let (Some(slot), Some(prepared)) =
-                (self.skinned_models.get(actor.model), prepared.as_ref())
-            else {
-                continue;
-            };
+        // One body, two callers: the pass below and the late draw once the
+        // disc is down. The arms are on the weapon's layer and have to be cut
+        // by the circle like the gun is, and they are the only skinned thing
+        // that ever is.
+        let draw_actor = |actor: &super::skinned_actor::SkinnedActorDraw,
+                          prepared: &PreparedActor| {
+            let Some(slot) = self.skinned_models.get(actor.model) else { return };
             let model = &slot.model;
             let model_matrix = prepared.model_matrix;
             let (joint_buffer, joint_offset) =
@@ -2827,6 +2827,18 @@ impl NativeMetalRenderer {
                     0,
                 );
             }
+        };
+
+        for (actor, prepared) in extracted.iter().zip(prepared) {
+            if !actor_in_view(actor, &planes) {
+                continue;
+            }
+            let Some(prepared) = prepared.as_ref() else { continue };
+            if masked_by_scope && actor.viewmodel {
+                late_actors.push((actor, prepared));
+                continue;
+            }
+            draw_actor(actor, prepared);
         }
 
         if let Some(meshes) = real_game_meshes {
@@ -2884,6 +2896,30 @@ impl NativeMetalRenderer {
                         bound = Some(flat);
                     }
                     draw_static_mesh(m);
+                }
+            }
+
+            if !late_actors.is_empty() {
+                // The disc is already down if there were meshes to draw late;
+                // stamping it twice is harmless either way, and the arms
+                // alone would otherwise go unmasked.
+                self.stamp_scope_disc(encoder, view_projection, msaa_enabled);
+                encoder.set_depth_stencil_state(&self.depth_state);
+                if let Some(pipeline) = skinned_pipeline {
+                    encoder.set_render_pipeline_state(pipeline);
+                    encoder.set_vertex_bytes(
+                        1,
+                        std::mem::size_of::<SkinnedPassUniforms>() as u64,
+                        &skinned_pass_uniforms as *const _ as *const _,
+                    );
+                    encoder.set_fragment_bytes(
+                        1,
+                        std::mem::size_of::<SkinnedPassUniforms>() as u64,
+                        &skinned_pass_uniforms as *const _ as *const _,
+                    );
+                    for (actor, prepared) in late_actors {
+                        draw_actor(actor, prepared);
+                    }
                 }
             }
         }
@@ -3177,6 +3213,7 @@ impl NativeMetalRenderer {
                     pose: super::skinned_actor::SkinnedActorPose::JointMatrices(actor.joint_matrices),
                     bounds_centre: actor.bounds_centre,
                     bounds_radius: actor.bounds_radius,
+                    viewmodel: actor.viewmodel,
                 }
             }));
         }

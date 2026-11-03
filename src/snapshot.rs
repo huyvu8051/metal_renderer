@@ -224,6 +224,10 @@ pub struct SkinnedRenderState {
     /// means the host did not supply one, and the actor is never culled.
     pub bounds_centre: [f32; 3],
     pub bounds_radius: f32,
+    /// The player's own arms, which ride the camera. Held back with the rest
+    /// of the weapon layer while a [`ScopeWindow`] is up, so the circle cuts
+    /// them rather than a threshold taking them away whole.
+    pub viewmodel: bool,
 }
 
 impl Default for CameraSnapshot {
