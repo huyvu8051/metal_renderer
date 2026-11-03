@@ -1729,6 +1729,73 @@ fn local_bounds(positions: &[[f32; 3]]) -> ([f32; 3], f32) {
 /// `real_game_textures` -- a borrow would make this self-referential and it
 /// could not live on the renderer at all. A `metal::Texture` is a refcount,
 /// so the clone is a retain, not a copy of any pixels.
+/// The sight picture after the opening has cut it down, in the opening's own
+/// plane: a convex polygon, its centre, and the frame to put it back into
+/// world space with.
+struct ScopeLens {
+    points: Vec<bevy::math::Vec2>,
+    mid: bevy::math::Vec2,
+    u: bevy::math::Vec3,
+    v: bevy::math::Vec3,
+    centre: bevy::math::Vec3,
+    forward: bevy::math::Vec3,
+}
+
+impl ScopeLens {
+    fn world(&self, p: bevy::math::Vec2, nudge: f32) -> [f32; 3] {
+        (self.centre - self.forward * nudge + self.u * p.x + self.v * p.y).to_array()
+    }
+
+    /// Two millimetres nearer the eye, so the black that follows loses the
+    /// depth test over this and wins everywhere else in the opening.
+    fn fan(&self) -> Vec<LineVertex> {
+        let hub = self.world(self.mid, 0.002);
+        let mut verts = Vec::with_capacity(self.points.len() * 3);
+        for i in 0..self.points.len() {
+            let j = (i + 1) % self.points.len();
+            for position in [hub, self.world(self.points[i], 0.002), self.world(self.points[j], 0.002)] {
+                verts.push(LineVertex { position, color: [0.0; 4] });
+            }
+        }
+        verts
+    }
+
+    /// A band of black laid just inside the rim, opaque at the edge and clear
+    /// a few millimetres in, so the picture does not end on a hard line.
+    ///
+    /// Drawn over the picture rather than instead of it: the black disc has
+    /// already stopped at the rim, and this only softens the last few
+    /// millimetres of what it left. Nearer the eye again than the fan, or it
+    /// would lose to the depth that fan wrote.
+    fn feather(&self, width: f32) -> Vec<LineVertex> {
+        let mut verts = Vec::with_capacity(self.points.len() * 6);
+        let inward = |p: bevy::math::Vec2| {
+            let out = p - self.mid;
+            let len = out.length();
+            // A polygon this wide never has a vertex nearer its centre than
+            // the band is deep, except when the lens is a sliver -- and then
+            // the whole sliver fading is the right answer anyway.
+            self.mid + out * ((len - width).max(0.0) / len.max(1e-6))
+        };
+        for i in 0..self.points.len() {
+            let j = (i + 1) % self.points.len();
+            let (a, b) = (self.points[i], self.points[j]);
+            let (ai, bi) = (inward(a), inward(b));
+            let edge = |p: bevy::math::Vec2| LineVertex {
+                position: self.world(p, 0.003),
+                color: [0.0, 0.0, 0.0, 1.0],
+            };
+            let clear = |p: bevy::math::Vec2| LineVertex {
+                position: self.world(p, 0.003),
+                color: [0.0, 0.0, 0.0, 0.0],
+            };
+            verts.extend([edge(a), clear(ai), clear(bi)]);
+            verts.extend([edge(a), clear(bi), edge(b)]);
+        }
+        verts
+    }
+}
+
 #[derive(Clone)]
 struct RealGameMeshDraw {
     /// Skipped by the scope pass: the gun is not part of the world the scope
@@ -2920,6 +2987,7 @@ impl NativeMetalRenderer {
                 }
 
                 self.draw_scope_shadow(encoder, view_projection, msaa_enabled);
+                self.draw_scope_feather(encoder, view_projection, msaa_enabled);
                 self.stamp_scope_disc(encoder, view_projection, msaa_enabled);
                 encoder.set_depth_stencil_state(&self.depth_state);
                 bind_sponza_pass_state();
@@ -3050,23 +3118,20 @@ impl NativeMetalRenderer {
     }
 
     /// The sight picture, clipped to the opening: the lens where the two
-    /// circles overlap.
+    /// circles overlap, as a polygon in the opening's own plane.
     ///
-    /// Clipped and not merely drawn, because this writes depth and depth is
-    /// what the weapon is tested against. An unclipped picture stamps its
-    /// circle over the tube wall as well, and the wall then loses the test
-    /// and the world shows through the side of the scope -- which is exactly
-    /// what a hard swing produced.
+    /// Clipped and not merely drawn, because the fan built from this writes
+    /// depth and depth is what the weapon is tested against. An unclipped
+    /// picture stamps its circle over the tube wall as well, and the wall
+    /// then loses the test and the world shows through the side of the scope
+    /// -- which is exactly what a hard swing produced.
     ///
     /// Built by sampling: the points of each circle that fall inside the
-    /// other, plus nothing else, sorted around their own centre. The
-    /// intersection of two discs is convex, so sorting by angle is a
-    /// polygon, and a fan over it is the region. Empty once they come apart,
-    /// which is the whole opening going black.
-    fn scope_picture_lens(
-        &self,
-        window: &super::snapshot::ScopeWindow,
-    ) -> Option<Vec<LineVertex>> {
+    /// other, plus the two places the rims cross, sorted around their own
+    /// centre. The intersection of two discs is convex, so sorting by angle
+    /// is a polygon. Empty once they come apart, which is the whole opening
+    /// going black.
+    fn scope_lens(&self, window: &super::snapshot::ScopeWindow) -> Option<ScopeLens> {
         let forward = bevy::math::Vec3::from_array(window.forward).normalize_or_zero();
         if forward == bevy::math::Vec3::ZERO || window.picture_radius <= 0.0 {
             return None;
@@ -3091,9 +3156,7 @@ impl NativeMetalRenderer {
 
         const SIDES: usize = 48;
         let mut points: Vec<bevy::math::Vec2> = Vec::with_capacity(SIDES);
-        for (centre, radius, other, other_radius) in
-            [(c1, r1, c2, r2), (c2, r2, c1, r1)]
-        {
+        for (centre, radius, other, other_radius) in [(c1, r1, c2, r2), (c2, r2, c1, r1)] {
             for i in 0..SIDES {
                 let a = i as f32 / SIDES as f32 * std::f32::consts::TAU;
                 let p = centre + bevy::math::Vec2::new(radius * a.cos(), radius * a.sin());
@@ -3121,20 +3184,7 @@ impl NativeMetalRenderer {
         points.sort_by(|a, b| {
             (a.y - mid.y).atan2(a.x - mid.x).total_cmp(&(b.y - mid.y).atan2(b.x - mid.x))
         });
-        // Two millimetres nearer the eye, so the black that follows loses the
-        // depth test over this and wins everywhere else in the opening.
-        let base = open_centre - forward * 0.002;
-        let world = |p: bevy::math::Vec2| (base + u * p.x + v * p.y).to_array();
-        let hub = world(mid);
-
-        let mut verts = Vec::with_capacity(points.len() * 3);
-        for i in 0..points.len() {
-            let j = (i + 1) % points.len();
-            for position in [hub, world(points[i]), world(points[j])] {
-                verts.push(LineVertex { position, color: [0.0; 4] });
-            }
-        }
-        Some(verts)
+        Some(ScopeLens { points, mid, u, v, centre: open_centre, forward })
     }
 
     /// The sight picture, into depth alone, two millimetres nearer the eye
@@ -3155,8 +3205,47 @@ impl NativeMetalRenderer {
         }
         let pipeline = if msaa_enabled { &self.disc_pipeline } else { &self.disc_pipeline_no_msaa };
         let Some(pipeline) = pipeline else { return };
-        let Some(verts) = self.scope_picture_lens(window) else { return };
-        self.draw_scope_disc(encoder, view_projection, pipeline, &verts);
+        let Some(lens) = self.scope_lens(window) else { return };
+        self.draw_scope_disc(encoder, view_projection, pipeline, &lens.fan());
+    }
+
+    /// Softens the rim the black stops at.
+    ///
+    /// The depth test that cuts the black at the picture is all or nothing,
+    /// which leaves the sight picture ending on a hard line. This lays a
+    /// band of black just inside that line, opaque at the edge and clear a
+    /// few millimetres in.
+    fn draw_scope_feather(
+        &self,
+        encoder: &metal::RenderCommandEncoderRef,
+        view_projection: [[f32; 4]; 4],
+        msaa_enabled: bool,
+    ) {
+        let Some(window) = self.scope_window.as_ref() else { return };
+        if window.picture_feather <= 0.0 {
+            return;
+        }
+        let pipeline = if msaa_enabled { &self.line_pipeline } else { &self.line_pipeline_no_msaa };
+        let Some(pipeline) = pipeline else { return };
+        let Some(lens) = self.scope_lens(window) else { return };
+        let verts = lens.feather(window.picture_feather);
+        if verts.is_empty() {
+            return;
+        }
+        // Blended, so it must not write depth; the band sits inside the
+        // opening, where the weapon loses to the disc anyway.
+        let buffer = self.device.new_buffer_with_data(
+            verts.as_ptr() as *const _,
+            (verts.len() * std::mem::size_of::<LineVertex>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let uniforms = LineUniforms { view_projection };
+        encoder.set_render_pipeline_state(pipeline);
+        encoder.set_depth_stencil_state(&self.blend_depth_state);
+        encoder.set_cull_mode(metal::MTLCullMode::None);
+        encoder.set_vertex_buffer(0, Some(&buffer), 0);
+        encoder.set_vertex_bytes(1, std::mem::size_of::<LineUniforms>() as u64, &uniforms as *const _ as *const _);
+        encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, verts.len() as u64);
     }
 
     /// The black a scope shows when the head is off the eyepiece.

@@ -110,6 +110,9 @@ pub struct ScopeWindow {
     pub picture_centre: [f32; 3],
     /// Zero for a sight that has no tube to shadow.
     pub picture_radius: f32,
+    /// How deep the black fades in at the rim of the picture, in metres.
+    /// Zero leaves the hard edge the depth test gives on its own.
+    pub picture_feather: f32,
 }
 
 pub struct CameraSnapshot {
