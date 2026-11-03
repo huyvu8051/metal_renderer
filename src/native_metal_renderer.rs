@@ -2902,10 +2902,13 @@ impl NativeMetalRenderer {
             // the circle it draws as it always did, which is what keeps the
             // tube solid when the sight is looked at rather than through.
             if !late.is_empty() || !marks.is_empty() {
-                self.stamp_scope_disc(encoder, view_projection, msaa_enabled);
+                // In this order, and each step leans on the one before it:
+                // the picture goes into depth, the mark is kept to what the
+                // picture covers, the black fills whatever the picture does
+                // not, and the opening's own disc finally shuts the weapon
+                // out of all of it.
+                self.stamp_scope_picture(encoder, view_projection, msaa_enabled);
 
-                // Before the weapon, so what is stored outside the circle is
-                // still the world rather than the tube.
                 if !marks.is_empty() {
                     encoder.set_depth_stencil_state(&self.reticle_depth_state);
                     bind_sponza_pass_state();
@@ -2915,6 +2918,9 @@ impl NativeMetalRenderer {
                         draw_static_mesh(m);
                     }
                 }
+
+                self.draw_scope_shadow(encoder, view_projection, msaa_enabled);
+                self.stamp_scope_disc(encoder, view_projection, msaa_enabled);
                 encoder.set_depth_stencil_state(&self.depth_state);
                 bind_sponza_pass_state();
                 forget_bound_textures();
@@ -2964,6 +2970,11 @@ impl NativeMetalRenderer {
     /// A fan of triangles rather than a quad: the opening is round, and a
     /// square hole would cut the corners off the picture. Thirty-two sides is
     /// under a pixel of error at the size this ever covers on screen.
+    /// Stamps the eyepiece opening into the depth buffer, colour untouched.
+    ///
+    /// Everything on the weapon's layer is drawn after this and tested
+    /// against it, so inside the circle the weapon loses and the world drawn
+    /// earlier is what stays.
     fn stamp_scope_disc(
         &self,
         encoder: &metal::RenderCommandEncoderRef,
@@ -2973,42 +2984,207 @@ impl NativeMetalRenderer {
         let Some(window) = self.scope_window.as_ref() else { return };
         let pipeline = if msaa_enabled { &self.disc_pipeline } else { &self.disc_pipeline_no_msaa };
         let Some(pipeline) = pipeline else { return };
-
         let centre = bevy::math::Vec3::from_array(window.centre);
-        let forward = bevy::math::Vec3::from_array(window.forward).normalize_or_zero();
-        if forward == bevy::math::Vec3::ZERO {
+        let Some(verts) = self.scope_disc(window, centre, window.radius, 0.0, [0.0; 4]) else {
             return;
+        };
+        self.draw_scope_disc(encoder, view_projection, pipeline, &verts);
+    }
+
+    /// A flat disc of triangles facing down the bore, in the opening's plane.
+    ///
+    /// `nudge` moves it towards the eye, which is how two of these are kept
+    /// apart in depth without being apart in the picture.
+    fn scope_disc(
+        &self,
+        window: &super::snapshot::ScopeWindow,
+        centre: bevy::math::Vec3,
+        radius: f32,
+        nudge: f32,
+        color: [f32; 4],
+    ) -> Option<Vec<LineVertex>> {
+        let forward = bevy::math::Vec3::from_array(window.forward).normalize_or_zero();
+        if forward == bevy::math::Vec3::ZERO || radius <= 0.0 {
+            return None;
         }
-        // Any two axes across the bore will do -- the disc is round, so where
+        // Any two axes across the bore will do -- a disc is round, so where
         // its first vertex lands does not matter.
         let across = if forward.x.abs() < 0.9 { bevy::math::Vec3::X } else { bevy::math::Vec3::Y };
-        let u = forward.cross(across).normalize() * window.radius;
-        let v = forward.cross(u).normalize() * window.radius;
+        let u = forward.cross(across).normalize();
+        let v = forward.cross(u).normalize();
+        let centre = centre - forward * nudge;
 
-        const SIDES: usize = 32;
-        let mut verts: Vec<LineVertex> = Vec::with_capacity(SIDES * 3);
+        const SIDES: usize = 48;
+        let mut verts = Vec::with_capacity(SIDES * 3);
         let rim = |i: usize| {
             let a = i as f32 / SIDES as f32 * std::f32::consts::TAU;
-            (centre + u * a.cos() + v * a.sin()).to_array()
+            (centre + u * (radius * a.cos()) + v * (radius * a.sin())).to_array()
         };
         for i in 0..SIDES {
-            verts.push(LineVertex { position: centre.to_array(), color: [0.0; 4] });
-            verts.push(LineVertex { position: rim(i), color: [0.0; 4] });
-            verts.push(LineVertex { position: rim((i + 1) % SIDES), color: [0.0; 4] });
+            for position in [centre.to_array(), rim(i), rim((i + 1) % SIDES)] {
+                verts.push(LineVertex { position, color });
+            }
         }
+        Some(verts)
+    }
+
+    fn draw_scope_disc(
+        &self,
+        encoder: &metal::RenderCommandEncoderRef,
+        view_projection: [[f32; 4]; 4],
+        pipeline: &metal::RenderPipelineStateRef,
+        verts: &[LineVertex],
+    ) {
         let buffer = self.device.new_buffer_with_data(
             verts.as_ptr() as *const _,
             (verts.len() * std::mem::size_of::<LineVertex>()) as u64,
             MTLResourceOptions::StorageModeShared,
         );
         let uniforms = LineUniforms { view_projection };
-
         encoder.set_render_pipeline_state(pipeline);
         encoder.set_depth_stencil_state(&self.depth_state);
         encoder.set_cull_mode(metal::MTLCullMode::None);
         encoder.set_vertex_buffer(0, Some(&buffer), 0);
         encoder.set_vertex_bytes(1, std::mem::size_of::<LineUniforms>() as u64, &uniforms as *const _ as *const _);
         encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, verts.len() as u64);
+    }
+
+    /// The sight picture, clipped to the opening: the lens where the two
+    /// circles overlap.
+    ///
+    /// Clipped and not merely drawn, because this writes depth and depth is
+    /// what the weapon is tested against. An unclipped picture stamps its
+    /// circle over the tube wall as well, and the wall then loses the test
+    /// and the world shows through the side of the scope -- which is exactly
+    /// what a hard swing produced.
+    ///
+    /// Built by sampling: the points of each circle that fall inside the
+    /// other, plus nothing else, sorted around their own centre. The
+    /// intersection of two discs is convex, so sorting by angle is a
+    /// polygon, and a fan over it is the region. Empty once they come apart,
+    /// which is the whole opening going black.
+    fn scope_picture_lens(
+        &self,
+        window: &super::snapshot::ScopeWindow,
+    ) -> Option<Vec<LineVertex>> {
+        let forward = bevy::math::Vec3::from_array(window.forward).normalize_or_zero();
+        if forward == bevy::math::Vec3::ZERO || window.picture_radius <= 0.0 {
+            return None;
+        }
+        let across = if forward.x.abs() < 0.9 { bevy::math::Vec3::X } else { bevy::math::Vec3::Y };
+        let u = forward.cross(across).normalize();
+        let v = forward.cross(u).normalize();
+
+        let open_centre = bevy::math::Vec3::from_array(window.centre);
+        let picture = bevy::math::Vec3::from_array(window.picture_centre);
+        // Into the opening's plane: the picture is a direction from the eye,
+        // so how far along the bore it was taken does not matter, but the two
+        // have to be compared in one plane or the lens is a cone section.
+        let picture = picture - forward * (picture - open_centre).dot(forward);
+        let flat = |p: bevy::math::Vec3| {
+            let d = p - open_centre;
+            bevy::math::Vec2::new(d.dot(u), d.dot(v))
+        };
+        let c1 = bevy::math::Vec2::ZERO;
+        let c2 = flat(picture);
+        let (r1, r2) = (window.radius, window.picture_radius);
+
+        const SIDES: usize = 48;
+        let mut points: Vec<bevy::math::Vec2> = Vec::with_capacity(SIDES);
+        for (centre, radius, other, other_radius) in
+            [(c1, r1, c2, r2), (c2, r2, c1, r1)]
+        {
+            for i in 0..SIDES {
+                let a = i as f32 / SIDES as f32 * std::f32::consts::TAU;
+                let p = centre + bevy::math::Vec2::new(radius * a.cos(), radius * a.sin());
+                if p.distance(other) <= other_radius {
+                    points.push(p);
+                }
+            }
+        }
+        // The two places the rims cross, so the lens keeps its corners at any
+        // sampling rate.
+        let d = c1.distance(c2);
+        if d > 1e-6 && d < r1 + r2 && d > (r1 - r2).abs() {
+            let e = (c2 - c1) / d;
+            let f = bevy::math::Vec2::new(-e.y, e.x);
+            let x = (d * d + r1 * r1 - r2 * r2) / (2.0 * d);
+            let y = (r1 * r1 - x * x).max(0.0).sqrt();
+            points.push(c1 + e * x + f * y);
+            points.push(c1 + e * x - f * y);
+        }
+        if points.len() < 3 {
+            return None;
+        }
+
+        let mid = points.iter().copied().sum::<bevy::math::Vec2>() / points.len() as f32;
+        points.sort_by(|a, b| {
+            (a.y - mid.y).atan2(a.x - mid.x).total_cmp(&(b.y - mid.y).atan2(b.x - mid.x))
+        });
+        // Two millimetres nearer the eye, so the black that follows loses the
+        // depth test over this and wins everywhere else in the opening.
+        let base = open_centre - forward * 0.002;
+        let world = |p: bevy::math::Vec2| (base + u * p.x + v * p.y).to_array();
+        let hub = world(mid);
+
+        let mut verts = Vec::with_capacity(points.len() * 3);
+        for i in 0..points.len() {
+            let j = (i + 1) % points.len();
+            for position in [hub, world(points[i]), world(points[j])] {
+                verts.push(LineVertex { position, color: [0.0; 4] });
+            }
+        }
+        Some(verts)
+    }
+
+    /// The sight picture, into depth alone, two millimetres nearer the eye
+    /// than anything else here.
+    ///
+    /// On its own it does nothing visible. What follows it does: the black
+    /// that covers the opening is depth-tested, so it fails over this circle
+    /// and paints everywhere else.
+    fn stamp_scope_picture(
+        &self,
+        encoder: &metal::RenderCommandEncoderRef,
+        view_projection: [[f32; 4]; 4],
+        msaa_enabled: bool,
+    ) {
+        let Some(window) = self.scope_window.as_ref() else { return };
+        if window.picture_radius <= 0.0 {
+            return;
+        }
+        let pipeline = if msaa_enabled { &self.disc_pipeline } else { &self.disc_pipeline_no_msaa };
+        let Some(pipeline) = pipeline else { return };
+        let Some(verts) = self.scope_picture_lens(window) else { return };
+        self.draw_scope_disc(encoder, view_projection, pipeline, &verts);
+    }
+
+    /// The black a scope shows when the head is off the eyepiece.
+    ///
+    /// The whole opening, painted, and depth-tested so it stops at the
+    /// picture stamped just before it. Nothing is clipped and nothing is
+    /// clamped: the picture may sit anywhere, half off the rim or clear of
+    /// it altogether, and the black simply covers whatever is left -- which
+    /// at a hard enough swing is the whole circle.
+    fn draw_scope_shadow(
+        &self,
+        encoder: &metal::RenderCommandEncoderRef,
+        view_projection: [[f32; 4]; 4],
+        msaa_enabled: bool,
+    ) {
+        let Some(window) = self.scope_window.as_ref() else { return };
+        if window.picture_radius <= 0.0 {
+            return;
+        }
+        let pipeline = if msaa_enabled { &self.line_pipeline } else { &self.line_pipeline_no_msaa };
+        let Some(pipeline) = pipeline else { return };
+        let centre = bevy::math::Vec3::from_array(window.centre);
+        let Some(verts) =
+            self.scope_disc(window, centre, window.radius, 0.0, [0.0, 0.0, 0.0, 1.0])
+        else {
+            return;
+        };
+        self.draw_scope_disc(encoder, view_projection, pipeline, &verts);
     }
 
     fn draw_debug_lines(

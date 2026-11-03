@@ -100,6 +100,16 @@ pub struct ScopeWindow {
     /// Down the bore, pointing away from the eye.
     pub forward: [f32; 3],
     pub radius: f32,
+    /// The sight picture: the circle the eye actually sees down the tube,
+    /// centred straight ahead of the eye rather than on the glass.
+    ///
+    /// The two are concentric only while the eye is on the tube's axis. Let
+    /// the weapon sway and the glass slides sideways while this stays put,
+    /// and the gap between them opens into a crescent on one side -- which
+    /// is the black a real scope shows when the head is off the eyepiece.
+    pub picture_centre: [f32; 3],
+    /// Zero for a sight that has no tube to shadow.
+    pub picture_radius: f32,
 }
 
 pub struct CameraSnapshot {
