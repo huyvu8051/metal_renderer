@@ -130,25 +130,9 @@ pub struct CameraSnapshot {
 
 
     pub wall_raise: f32,
-}
-
-pub struct ScopeCameraSnapshot {
-    pub eye: [f32; 3],
-    pub rotation: [f32; 4],
-
-    pub active: bool,
-
-    pub fov: f32,
-
-    pub lens_world_pos: [f32; 3],
-
-    pub lens_local_rotation: [f32; 4],
-}
-
-#[derive(Default)]
+}#[derive(Default)]
 pub struct RenderSnapshot {
     pub camera: Option<CameraSnapshot>,
-    pub scope_camera: Option<ScopeCameraSnapshot>,
     /// Where the depth disc goes, if a sight with a tube is fitted.
     pub scope_window: Option<ScopeWindow>,
     pub skinned_actors: Vec<SkinnedRenderState>,
