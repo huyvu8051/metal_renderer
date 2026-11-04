@@ -108,6 +108,13 @@ pub struct ScopeWindow {
     /// and the gap between them opens into a crescent on one side -- which
     /// is the black a real scope shows when the head is off the eyepiece.
     pub picture_centre: [f32; 3],
+    /// Whether the weapon hides behind this opening.
+    ///
+    /// True for a tube the eye goes inside. False for a holographic, which
+    /// is a pane of glass on a rail: nothing is in the way, so nothing is
+    /// held back -- the opening is only there to cut the mark when sway
+    /// carries it off the glass.
+    pub masks_weapon: bool,
     /// Zero for a sight that has no tube to shadow.
     pub picture_radius: f32,
     /// How deep the black fades in at the rim of the picture, in metres.

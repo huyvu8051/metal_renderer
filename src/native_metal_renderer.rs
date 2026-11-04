@@ -2680,7 +2680,11 @@ impl NativeMetalRenderer {
         let mut late_actors: Vec<(&super::skinned_actor::SkinnedActorDraw, &PreparedActor)> =
             Vec::new();
         let mut marks: Vec<&RealGameMeshDraw> = Vec::new();
-        let masked_by_scope = self.scope_window.is_some();
+        // A tube hides the weapon; a pane of glass does not. Either way the
+        // mark is held back, because either way it has to be cut to the
+        // opening.
+        let masked_by_scope = self.scope_window.as_ref().is_some_and(|w| w.masks_weapon);
+        let clipping_marks = self.scope_window.is_some();
         let shadows_on = self.shadow_quality_requested > 0;
         let sponza_pipeline = match (msaa_enabled, shadows_on) {
             (true, true) => self.sponza_pipeline.as_ref(),
@@ -2815,7 +2819,7 @@ impl NativeMetalRenderer {
                 .filter_map(|slot| meshes.get(*slot).and_then(|m| m.as_ref()))
                 .filter(|m| !m.is_blend && draws_in_view(m, &planes))
             {
-                if masked_by_scope && m.reticle {
+                if clipping_marks && m.reticle {
                     marks.push(m);
                     continue;
                 }
@@ -2970,11 +2974,16 @@ impl NativeMetalRenderer {
             // tube solid when the sight is looked at rather than through.
             if !late.is_empty() || !marks.is_empty() {
                 // In this order, and each step leans on the one before it:
-                // the picture goes into depth, the mark is kept to what the
-                // picture covers, the black fills whatever the picture does
-                // not, and the opening's own disc finally shuts the weapon
-                // out of all of it.
-                self.stamp_scope_picture(encoder, view_projection, msaa_enabled);
+                // something goes into depth for the mark to be kept inside --
+                // the sight picture where there is one, the bare opening
+                // otherwise -- then the mark, then the black that fills what
+                // the picture does not cover, and last the opening's own disc,
+                // which shuts the weapon out of all of it.
+                if self.scope_window.as_ref().is_some_and(|w| w.picture_radius > 0.0) {
+                    self.stamp_scope_picture(encoder, view_projection, msaa_enabled);
+                } else {
+                    self.stamp_scope_disc(encoder, view_projection, msaa_enabled);
+                }
 
                 if !marks.is_empty() {
                     encoder.set_depth_stencil_state(&self.reticle_depth_state);
