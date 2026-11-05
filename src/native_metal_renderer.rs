@@ -3315,7 +3315,12 @@ impl NativeMetalRenderer {
         let uniforms = LineUniforms { view_projection };
 
         encoder.set_render_pipeline_state(pipeline);
-        encoder.set_depth_stencil_state(&self.depth_state);
+        // Through the world rather than behind it. These lines mark where
+        // bones and hitboxes are, and a bone is inside the body it belongs
+        // to -- depth-tested, the whole drawing is hidden by the very thing
+        // it describes. No depth write either, so nothing drawn afterwards
+        // tests against a line.
+        encoder.set_depth_stencil_state(&self.ui_depth_state);
         encoder.set_vertex_buffer(0, Some(&buffer), 0);
         encoder.set_vertex_bytes(1, std::mem::size_of::<LineUniforms>() as u64, &uniforms as *const _ as *const _);
         encoder.draw_primitives(MTLPrimitiveType::Line, 0, verts.len() as u64);
